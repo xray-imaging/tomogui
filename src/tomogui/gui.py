@@ -1,4 +1,10 @@
 import os, glob, json
+
+# HDF5 file locking on NFS is broken (returns EAGAIN even when nothing holds
+# the file). Disable it globally in this process AND its subprocesses BEFORE
+# any h5py import can pick up the default. Every subsequent QProcess inherits
+# this via os.environ.
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 import numpy as np
 
 # Disable vsync for better remote performance
@@ -41,8 +47,8 @@ except ImportError:
 # VirtualGL sets VGL_DISPLAY; absent that, fall back to the pyqtgraph software renderer.
 if VISPY_AVAILABLE:
     _is_ssh = bool(os.environ.get('SSH_CONNECTION') or
-                   os.environ.get('SSH_CLIENT') or
-                   os.environ.get('SSH_TTY'))
+                    os.environ.get('SSH_CLIENT') or
+                    os.environ.get('SSH_TTY'))
     _has_vgl = bool(os.environ.get('VGL_DISPLAY') or os.environ.get('VGL_ISACTIVE'))
     if _is_ssh and not _has_vgl:
         print("SSH X11 forwarding detected: switching to pyqtgraph renderer (VisPy/OpenGL unavailable)")
@@ -51,13 +57,14 @@ if VISPY_AVAILABLE:
 # PyQtGraph: pure-software renderer that works over SSH X11 forwarding
 try:
     import pyqtgraph as pg
-    import matplotlib.cm as _mpl_cm
+    import matplotlib as _mpl
     pg.setConfigOptions(useOpenGL=False, imageAxisOrder='row-major')
     PG_AVAILABLE = True
 except ImportError:
     PG_AVAILABLE = False
 
 from .theme_manager import ThemeManager
+from .chatbot import ChatBotDialog
 from .hdf5_viewer import HDF5ImageDividerDialog
 from .batch_progress_window import ProgressWindow
 
@@ -88,7 +95,7 @@ class SyncWatcher(QThread):
         """Return (n_projections_written, n_angles_expected) or (0, 0) on error."""
         try:
             with h5py.File(filepath, 'r') as f:
-                data  = f.get('/exchange/data')
+                data = f.get('/exchange/data')
                 theta = f.get('/exchange/theta')
                 if data is None or theta is None:
                     return 0, 0
@@ -143,7 +150,7 @@ class MachineSettingsDialog(QDialog):
         info = QLabel(
             "Configure remote machines for batch reconstruction.\n"
             "Leave username empty to use current system username.\n"
-            "Conda environment defaults to 'tomocupy' if not specified."
+          "Conda environment defaults to 'tomocupy' if not specified."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -233,6 +240,8 @@ class TomoGUI(QWidget):
         self.theme_manager = ThemeManager()
         self.theme_manager.register_callback(self._on_theme_changed)
 
+        self._chatbot_dialog = None
+
         #initialize progress bar for batch process
         self.progress_window = ProgressWindow(self)
         #stop button in progress window stops the same batch queue
@@ -247,7 +256,13 @@ class TomoGUI(QWidget):
         self.vmin = None
         self.vmax = None
         self.preview_files = []
+        # self.full_files holds either a list of TIFF paths (legacy tiff
+        # output) or a list of integer slice indices into an H5 volume.
+        # self.full_h5 is the open h5py handle when we're viewing an H5
+        # reconstruction; None for TIFF mode.
         self.full_files = []
+        self.full_h5 = None
+        self.full_h5_path = None
         self.process = []
         self._current_img = None
         self._current_img_path = None
@@ -496,6 +511,14 @@ class TomoGUI(QWidget):
         help_tomo_btn.setStyleSheet("QPushButton { font-size: 10.5pt; color: green; }")
         help_tomo_btn.clicked.connect(self.help_tomo)
         others_ops.addWidget(help_tomo_btn)
+        ask_claude_btn = QPushButton("Ask recon")
+        ask_claude_btn.setStyleSheet("QPushButton { font-size: 10.5pt; color: #FF8C00; font-weight: bold; }")
+        ask_claude_btn.setToolTip(
+            "Open a chat dialog to ask Claude about tomocupy parameters and tomogui workflow.\n"
+            "Requires the 'anthropic' package (pip install anthropic) and an ANTHROPIC_API_KEY."
+        )
+        ask_claude_btn.clicked.connect(self._open_chatbot)
+        others_ops.addWidget(ask_claude_btn)
         main_tab.addLayout(others_ops)
 
         # Row 4 - batch process table
@@ -503,7 +526,7 @@ class TomoGUI(QWidget):
         self.batch_file_main_table.cellClicked.connect(self.on_table_row_clicked)
         self.batch_file_main_table.setStyleSheet("""
                                             QTableWidget {
-                                             font-size: 10.5pt; /* Set font size for the table cells */
+                                                font-size: 10.5pt; /* Set font size for the table cells */
                                             }
                                             QHeaderView::section {
                                                 font-size: 10.5pt; /* Set font size for the header */
@@ -512,7 +535,7 @@ class TomoGUI(QWidget):
                                                 """)
         self.batch_file_main_table.setColumnCount(7)
         self.batch_file_main_table.setHorizontalHeaderLabels(["Select","File Name", "COR",
-                                                         "Status", "Size", "Pixel", "View Data"])
+                                                        "Status", "Size", "Pixel", "View Data"])
         self.batch_file_main_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         header = self.batch_file_main_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)  # Allow user to resize columns
@@ -632,7 +655,7 @@ class TomoGUI(QWidget):
         )
         self.batch_ai_phase_infer = _mk_phase(
             "Infer", True,
-            "Phase B — run AI inference on each file's try_center TIFFs and "
+          "Phase B — run AI inference on each file's try_center TIFFs and "
             "fill the COR cell."
         )
         self.batch_ai_phase_full = _mk_phase(
@@ -649,14 +672,14 @@ class TomoGUI(QWidget):
         fix_cor_btn = QPushButton("Fix COR Outliers")
         fix_cor_btn.setStyleSheet("QPushButton { font-size: 10.5pt; color: #8e44ad; }")
         fix_cor_btn.setToolTip("Detect outlier COR values among selected files and replace "
-                               "each outlier with the average of its two neighbours")
+                              "each outlier with the average of its two neighbours")
         fix_cor_btn.clicked.connect(lambda: self._fix_cor_outliers())
         batch_ops.addWidget(fix_cor_btn)
         clear_cor_btn = QPushButton("Clear CORs")
         clear_cor_btn.setStyleSheet("QPushButton { font-size: 10.5pt; color: #b26a00; }")
         clear_cor_btn.setToolTip("Clear the COR value for every checked file "
-                                 "(table and rot_cen.json). Useful before "
-                                 "re-running AI Reco from scratch.")
+                                "(table and rot_cen.json). Useful before "
+                                "re-running AI Reco from scratch.")
         clear_cor_btn.clicked.connect(self._clear_selected_cors)
         batch_ops.addWidget(clear_cor_btn)
         batch_ops.addWidget(QLabel("max Δ:"))
@@ -708,7 +731,7 @@ class TomoGUI(QWidget):
 
         # Sync Acquisition button (bottom of left panel)
         sync_row = QHBoxLayout()
-        self.sync_btn = QPushButton("▶  Sync Acquisition")
+        self.sync_btn = QPushButton(" Sync Acquisition")
         self.sync_btn.setStyleSheet(
             "QPushButton { font-size: 11pt; font-weight: bold; color: white; "
             "background-color: #2e7d32; padding: 6px 18px; border-radius: 4px; }"
@@ -727,6 +750,7 @@ class TomoGUI(QWidget):
         self._build_Geometry_tab()
         self._build_Data_tab()        
         self._build_Performance_tab()
+        self._build_ai_tab()
         self._build_advanced_config_tab()
         # Progress bar
         # self.progress = QProgressBar()
@@ -873,7 +897,7 @@ class TomoGUI(QWidget):
         toolbar_row.addWidget(self.max_input)
 
         # Theme toggle button
-        self.theme_toggle_btn = QPushButton("🌙" if self.theme_manager.get_current_theme() == 'bright' else "☀")
+        self.theme_toggle_btn = QPushButton("" if self.theme_manager.get_current_theme() == 'bright' else "")
         self.theme_toggle_btn.setFixedWidth(35)
         self.theme_toggle_btn.setToolTip("Toggle bright/dark theme")
         self.theme_toggle_btn.clicked.connect(self._toggle_theme)
@@ -909,7 +933,7 @@ class TomoGUI(QWidget):
         self.slice_slider.setStyleSheet("""
             QSlider::groove:horizontal { height: 20px; background: #ccc; border-radius: 5px; }
             QSlider::handle:horizontal { background: #4CAF50; border: 1px solid #5c5c5c; width: 20px; height: 20px;
-                                         margin: -5px 0; border-radius: 10px; }
+                                            margin: -5px 0; border-radius: 10px; }
         """)
         slider_layout.addWidget(QLabel("Image Index:"))
         slider_layout.addWidget(self.slice_slider)
@@ -1126,8 +1150,8 @@ class TomoGUI(QWidget):
 
         add_line("--nsino", "", include=False) #always include
         #add_line("--nsino", "0.5 or [0,0.9]", include=False) #always include
-#        add_dspin("--rotation-axis", -1e9, 1e9, step=0.01, default=-1.0)
-#        add_combo("--rotation-axis-auto", ["manual","auto"], default="manual")
+#       add_dspin("--rotation-axis", -1e9, 1e9, step=0.01, default=-1.0)
+#       add_combo("--rotation-axis-auto", ["manual","auto"], default="manual")
         add_combo("--rotation-axis-method", ["sift","vo"], default="sift", include=False) #always include
         add_line("--rotation-axis-pairs", "[0,1499] or [0,1499,749,2249]")
         add_dspin("--rotation-axis-sift-threshold", 0.0, 1.0, step=0.01, default=0.5)
@@ -1138,6 +1162,98 @@ class TomoGUI(QWidget):
         add_combo("--reconstruction-algorithm", ["fourierrec","linerec"], default="fourierrec", include=False) #always include
 
         self.tabs.addTab(params_tab, "Reconstruction")
+
+    def _strip_flag(self, cmd, flag):
+        """Remove every ``flag`` (and its value if the flag takes one) from
+        ``cmd``. Returns a new list. Used to drop stale flag values that
+        would otherwise shadow the AI-COR overrides we append later — argparse
+        keeps the *last* occurrence, so any conflicting later value silently
+        wins."""
+        out = []
+        skip = False
+        for a in cmd:
+            if skip:
+                skip = False
+                continue
+            if a == flag:
+                skip = True
+                continue
+            out.append(a)
+        return out
+
+    def _apply_ai_cor(self, cmd, ai_search_method=None):
+        """Return ``cmd`` with the AI-COR flags applied *last*. Any stale
+        ``--rotation-axis-*`` / ``--ai-search-method`` / infer flags the
+        caller may have already appended are stripped first so argparse
+        sees only what we mean.
+
+        The search method (``fine`` or ``full``) defaults to whatever the
+        user picked on the AI COR tab. Extra ``--infer-*`` / ``--bin-infer-*``
+        parameters the user enabled on that tab are appended too.
+        """
+        if ai_search_method is None:
+            ai_search_method = self._current_ai_search_method()
+        ai_flags = self._ai_cor_args(ai_search_method)
+        if not ai_flags:
+            return cmd
+
+        # Every flag the AI tab (or _ai_cor_args) can emit must be stripped
+        # from earlier positions — otherwise an opt-in on the tab could be
+        # shadowed by whatever a --config file or another gatherer produced
+        # first (argparse keeps the LAST occurrence).
+        strip_flags = {"--rotation-axis-method", "--ai-search-method",
+                      "--infer-model-path", "--bin-infer-model-path"}
+        tab_flags = self._gather_ai_args()
+        strip_flags.update(f for f in tab_flags if f.startswith("--"))
+        for flag in strip_flags:
+            cmd = self._strip_flag(cmd, flag)
+        return cmd + ai_flags + tab_flags
+
+    def _ai_cor_args(self, ai_search_method="fine"):
+        """Return tomocupy CLI flags that turn on its built-in AI COR finder
+        for a `try` reconstruction. Returns [] when the AI model path is not
+        set — callers then fall back to whatever COR method they were using.
+
+        Tomocupy runs the try recon and the AI center search in a single
+        subprocess and writes ``center_of_rotation.txt`` inside the try
+        output directory (``{data}_rec/try_center/{proj}/``).
+
+        Both ``--infer-model-path`` and ``--bin-infer-model-path`` are set to
+        the same file: ``full`` mode runs the two-stage bin refinement
+        (reads ``bin_infer_model_path``) and THEN a final ``run_rec`` that
+        internally calls ``_find_center_ai`` (reads ``infer_model_path``).
+        Passing only one flag makes ``full`` crash on the second call.
+        """
+        model_path = self.ai_model_path.text().strip()
+        if not model_path or not os.path.exists(model_path):
+            return []
+        return [
+            "--rotation-axis-method", "ai",
+            "--ai-search-method", ai_search_method,
+            "--infer-model-path", model_path,
+            "--bin-infer-model-path", model_path,
+        ]
+
+    def _read_ai_cor_from_try_dir(self, proj_file):
+        """Read the last value written to center_of_rotation.txt inside the
+        try output directory for ``proj_file``. Returns the COR as a float
+        on success, or ``None`` if the file is missing/empty/unparseable."""
+        data_folder = self.data_path.text().strip()
+        if not data_folder:
+            return None
+        proj_name = os.path.splitext(os.path.basename(proj_file))[0]
+        cor_txt = os.path.join(f"{data_folder}_rec", "try_center",
+                              proj_name, "center_of_rotation.txt")
+        if not os.path.exists(cor_txt):
+            return None
+        try:
+            with open(cor_txt) as fh:
+                lines = [ln.strip() for ln in fh if ln.strip()]
+            if not lines:
+                return None
+            return float(lines[-1].split()[-1])
+        except (OSError, ValueError):
+            return None
 
     def _gather_params_args(self):
         args = []
@@ -1878,7 +1994,7 @@ class TomoGUI(QWidget):
         add_line("--dark-file-name", "/path/dark.h5")
         add_line("--flat-file-name", "/path/flat.h5")
         add_line("--out-path-name", "/path/out")
-        add_combo("--save-format", ["tiff","h5","h5sino","h5nolinks"], default="tiff", include=False) #always include
+        add_combo("--save-format", ["h5nolinks","h5","h5sino","tiff"], default="h5nolinks", include=False) #always include; matches tomocupy default
         add_check("--config-update")
         add_line("--logs-home", "/home/user/logs", include=False) #always include
         add_check("--verbose", include=False) #always include
@@ -2057,6 +2173,214 @@ class TomoGUI(QWidget):
 
         return args
 
+# ===== AI COR TAB =====
+    def _build_ai_tab(self):
+        """AI COR settings tab. Exposes tomocupy's --infer-* (fine mode) and
+        --bin-infer-* (full/bin mode) inference parameters. The tab also owns
+        the --ai-search-method selector, which _apply_ai_cor reads to decide
+        which pipeline flag family to pass through."""
+        ai_tab = QWidget()
+        outer = QVBoxLayout(ai_tab)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        form_host = QWidget()
+        form = QFormLayout(form_host)
+        scroll.setWidget(form_host)
+        outer.addWidget(scroll)
+
+        self.ai_widgets = {}
+
+        def _add_row(flag, kind, w, default=None, label_text=None, include=True):
+            label_text = label_text or flag
+            label_widget = QWidget()
+            h = QHBoxLayout(label_widget)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            lbl = QLabel(label_text)
+            include_cb = None
+            if include:
+                include_cb = QCheckBox()
+                include_cb.setChecked(False)
+                h.addWidget(include_cb)
+                lbl.setEnabled(False)
+                w.setEnabled(False)
+
+                def on_toggle(checked):
+                    lbl.setEnabled(checked)
+                    w.setEnabled(checked)
+                    if not checked:
+                        if kind in ("spin", "dspin") and default is not None:
+                            w.blockSignals(True)
+                            w.setValue(default)
+                            w.blockSignals(False)
+                        elif kind == "combo":
+                            if default is not None:
+                                w.setCurrentText(str(default))
+                            else:
+                                w.setCurrentIndex(0)
+                        elif kind == "line":
+                            w.clear()
+                        elif kind == "check":
+                            w.setChecked(False)
+
+                include_cb.toggled.connect(on_toggle)
+            else:
+                lbl.setEnabled(True)
+                w.setEnabled(True)
+            h.addWidget(lbl)
+            h.addStretch(1)
+            form.addRow(label_widget, w)
+            self.ai_widgets[flag] = (kind, w, include_cb, default)
+
+        def add_line(flag, placeholder="", tip="", width=240, include=True,
+                    default_text=""):
+            w = QLineEdit()
+            if placeholder:
+                w.setPlaceholderText(placeholder)
+            if tip:
+                w.setToolTip(tip)
+            w.setFixedWidth(width)
+            if default_text:
+                w.setText(default_text)
+            _add_row(flag, "line", w, default="", include=include)
+
+        def add_combo(flag, items, default=None, tip="", include=True):
+            w = QComboBox()
+            w.addItems(items)
+            if default in items:
+                w.setCurrentText(default)
+            if tip:
+                w.setToolTip(tip)
+            _add_row(flag, "combo", w, default=default, include=include)
+
+        def add_check(flag, tip="", include=True, default_checked=False):
+            w = QCheckBox()
+            if default_checked:
+                w.setChecked(True)
+            if tip:
+                w.setToolTip(tip)
+            _add_row(flag, "check", w, default=False, include=include)
+
+        def add_spin(flag, minv, maxv, step=1, default=None, tip="", include=True):
+            w = QSpinBox()
+            w.setRange(minv, maxv)
+            w.setSingleStep(step)
+            if default is not None:
+                w.setValue(default)
+            if tip:
+                w.setToolTip(tip)
+            _add_row(flag, "spin", w, default=default, include=include)
+
+        # Search-method selector (always included; controls which pipeline
+        # tomocupy runs and thus which flag family below is relevant).
+        add_combo("--ai-search-method", ["fine", "full"], default="fine",
+                    tip="fine: single-stage inference_pipeline. "
+                        "full: two-stage bin_inference_pipeline.",
+                  include=False)
+
+        # ---- fine-mode --infer-* params ---------------------------------
+        add_check("--infer-use-8bits", default_checked=True,
+                    tip="Requantize pixels to 8 bits before inference.")
+        add_line("--infer-downsample-factor",
+                placeholder="[1] or [1,2,4]",
+                tip="List of downsample factors applied to try slices.")
+        add_line("--infer-num-windows",
+                placeholder="[3]",
+                tip="Number of aggregation windows per slice.")
+        add_line("--infer-window-size",
+                placeholder="[518]",
+                tip="Square window size (DINOv2 native = 518).")
+        add_spin("--infer-seed-number", 0, 1_000_000, step=1, default=10,
+                tip="RNG seed for reproducibility.")
+        add_combo("--infer-input-data-type", ["raw", "try"], default="raw",
+                    tip="Which cache the AI inference reads from.")
+        add_check("--infer-save-intermediate-data",
+                    tip="Save per-slice model predictions to predicts_all.npz.")
+        add_line("--infer-input-dir",
+                placeholder="/path/to/tiff/dir or blank",
+                tip="Direct TIFF input dir (bypass try cache).")
+        add_line("--infer-batch-list",
+                placeholder="/path/to/list.txt or blank",
+                tip="Batch txt file listing input directories.")
+        add_line("--infer-out-dir-name",
+                placeholder="/path/for/output or blank",
+                tip="Output batches directory.")
+
+        # ---- full/bin-mode --bin-infer-* params -------------------------
+        add_line("--bin-infer-bin-sizes",
+                placeholder="[24,12]",
+                tip="Pixel step per bin per refinement stage.")
+        add_line("--bin-infer-bin-counts",
+                placeholder="[4,2]",
+                tip="Bins per stage (must be even).")
+        add_spin("--bin-infer-num-frames", 1, 1024, step=1, default=2,
+                tip="Frames aggregated per bin.")
+        add_line("--bin-infer-num-windows",
+                placeholder="[20]",
+                tip="Aggregation windows for bin inference.")
+        add_line("--bin-infer-window-size",
+                placeholder="[518]",
+                tip="Square window size for bin inference.")
+        add_spin("--bin-infer-aggregator-depth", 1, 64, step=1, default=5,
+                tip="Attention layers in the feature aggregator.")
+        add_spin("--bin-infer-aggregator-num-heads", 1, 64, step=1, default=12,
+                tip="Attention heads per layer.")
+        add_line("--bin-infer-downsample-factor",
+                placeholder="[1]",
+                tip="Downsample factor applied to try slices (bin mode).")
+        add_combo("--bin-infer-input-data-type", ["raw", "try"], default="raw",
+                    tip="Which cache the bin AI reads from.")
+        add_spin("--bin-infer-seed-number", 0, 1_000_000, step=1, default=10,
+                tip="RNG seed for reproducibility (bin mode).")
+        add_check("--bin-infer-use-8bits", default_checked=True,
+                    tip="Requantize pixels to 8 bits (bin mode).")
+        add_check("--bin-infer-save-intermediate-data",
+                    tip="Save per-slice bin predictions to range_predicts_all.npz.")
+        add_line("--bin-infer-input-dir",
+                placeholder="/path/to/tiff/dir or blank")
+        add_line("--bin-infer-batch-list",
+                placeholder="/path/to/list.txt or blank")
+        add_line("--bin-infer-out-dir-name",
+                placeholder="/path/for/output or blank")
+
+        self.tabs.addTab(ai_tab, "AI COR")
+
+    def _gather_ai_args(self):
+        """Return the AI-COR CLI flags currently enabled on the AI tab.
+        Skipped when the model path is not set (nothing else makes sense
+        without a model)."""
+        model_path = self.ai_model_path.text().strip()
+        if not model_path or not os.path.exists(model_path):
+            return []
+        args = []
+        for flag, (kind, w, include_cb, _default) in self.ai_widgets.items():
+            if include_cb is not None and not include_cb.isChecked():
+                continue
+            if kind == "line":
+                val = w.text().strip()
+                if val != "":
+                    args += [flag, val]
+            elif kind == "combo":
+                args += [flag, w.currentText().strip()]
+            elif kind == "check":
+                if w.isChecked():
+                    args += [flag]
+            elif kind in ("spin", "dspin"):
+                args += [flag, str(w.value())]
+        return args
+
+    def _current_ai_search_method(self):
+        """Read the AI search method (fine|full) from the tab widget."""
+        entry = getattr(self, 'ai_widgets', {}).get("--ai-search-method")
+        if entry is None:
+            return "fine"
+        _, w, _, _ = entry
+        try:
+            return w.currentText().strip() or "fine"
+        except (AttributeError, RuntimeError):
+            return "fine"
+
         # ===== advanced config tab====
     def _build_advanced_config_tab(self):
         config_tab = QWidget()
@@ -2110,37 +2434,37 @@ class TomoGUI(QWidget):
 
     #     # ==== BATCH PROCESSING TAB ====
     #     batch_tab = QWidget()
-    #     self.tabs.addTab(batch_tab, "Batch Processing")
+    #    self.tabs.addTab(batch_tab, "Batch Processing")
     #     self._build_batch_tab(batch_tab)
 
     # def _build_batch_tab(self, batch_tab):
-    #     """Build the batch processing tab for managing multiple datasets"""
+    #    """Build the batch processing tab for managing multiple datasets"""
     #     main_layout = QVBoxLayout(batch_tab)
 
     #     # Top controls
     #     controls_layout = QHBoxLayout()
 
-    #     refresh_list_btn = QPushButton("Refresh File List")
+    #    refresh_list_btn = QPushButton("Refresh File List")
     #     refresh_list_btn.clicked.connect(self._refresh_batch_file_list)
     #     controls_layout.addWidget(refresh_list_btn)
 
-    #     save_cor_btn = QPushButton("Save COR to CSV")
+    #    save_cor_btn = QPushButton("Save COR to CSV")
     #     save_cor_btn.clicked.connect(self._batch_save_cor_csv)
-    #     save_cor_btn.setToolTip("Save COR values to batch_cor_values.csv in data folder")
+    #    save_cor_btn.setToolTip("Save COR values to batch_cor_values.csv in data folder")
     #     controls_layout.addWidget(save_cor_btn)
 
-    #     load_cor_btn = QPushButton("Load COR from CSV")
+    #    load_cor_btn = QPushButton("Load COR from CSV")
     #     load_cor_btn.clicked.connect(self._batch_load_cor_csv)
-    #     load_cor_btn.setToolTip("Load COR values from batch_cor_values.csv in data folder")
+    #    load_cor_btn.setToolTip("Load COR values from batch_cor_values.csv in data folder")
     #     controls_layout.addWidget(load_cor_btn)
 
     #     controls_layout.addStretch()
 
-    #     select_all_btn = QPushButton("Select All")
+    #    select_all_btn = QPushButton("Select All")
     #     select_all_btn.clicked.connect(self._batch_select_all)
     #     controls_layout.addWidget(select_all_btn)
 
-    #     deselect_all_btn = QPushButton("Deselect All")
+    #    deselect_all_btn = QPushButton("Deselect All")
     #     deselect_all_btn.clicked.connect(self._batch_deselect_all)
     #     controls_layout.addWidget(deselect_all_btn)
 
@@ -2150,7 +2474,7 @@ class TomoGUI(QWidget):
     #     self.batch_file_table = QTableWidget()
     #     self.batch_file_table.setColumnCount(9)
     #     self.batch_file_table.setHorizontalHeaderLabels([
-    #         "Select", "Filename", "Size", "COR", "Status", "View Data", "View Try", "View Full", "Actions"
+    #        "Select", "Filename", "Size", "COR", "Status", "View Data", "View Try", "View Full", "Actions"
     #     ])
 
     #     # Configure table
@@ -2175,26 +2499,26 @@ class TomoGUI(QWidget):
 
     #     # Machine and GPU configuration
     #     machine_layout = QHBoxLayout()
-    #     machine_layout.addWidget(QLabel("Target Machine:"))
+    #    machine_layout.addWidget(QLabel("Target Machine:"))
 
     #     self.batch_machine_box = QComboBox()
-    #     self.batch_machine_box.addItems(["Local", "tomo1", "tomo2", "tomo3", "tomo4", "tomo5"])
-    #     self.batch_machine_box.setCurrentText("Local")
-    #     self.batch_machine_box.setToolTip("Select machine to run batch reconstructions")
+    #    self.batch_machine_box.addItems(["Local", "tomo1", "tomo2", "tomo3", "tomo4", "tomo5"])
+    #    self.batch_machine_box.setCurrentText("Local")
+    #    self.batch_machine_box.setToolTip("Select machine to run batch reconstructions")
     #     machine_layout.addWidget(self.batch_machine_box)
 
     #     machine_layout.addSpacing(20)
-    #     machine_layout.addWidget(QLabel("GPUs per machine:"))
+    #    machine_layout.addWidget(QLabel("GPUs per machine:"))
 
     #     self.batch_gpus_per_machine_batch = QSpinBox()
     #     self.batch_gpus_per_machine_batch.setMinimum(1)
     #     self.batch_gpus_per_machine_batch.setMaximum(8)
     #     self.batch_gpus_per_machine_batch.setValue(1)
-    #     self.batch_gpus_per_machine_batch.setToolTip("Number of GPUs available on the target machine (1 job per GPU)")
+    #    self.batch_gpus_per_machine_batch.setToolTip("Number of GPUs available on the target machine (1 job per GPU)")
     #     machine_layout.addWidget(self.batch_gpus_per_machine_batch)
 
     #     machine_layout.addSpacing(20)
-    #     self.batch_queue_label = QLabel("Queue: 0 jobs waiting")
+    #    self.batch_queue_label = QLabel("Queue: 0 jobs waiting")
     #     machine_layout.addWidget(self.batch_queue_label)
 
     #     machine_layout.addStretch()
@@ -2203,38 +2527,38 @@ class TomoGUI(QWidget):
     #     # Batch operations
     #     batch_ops_layout = QHBoxLayout()
 
-    #     batch_ops_layout.addWidget(QLabel("Batch Operations (on selected):"))
+    #    batch_ops_layout.addWidget(QLabel("Batch Operations (on selected):"))
 
-    #     batch_try_btn = QPushButton("Run Try on Selected")
+    #    batch_try_btn = QPushButton("Run Try on Selected")
     #     batch_try_btn.clicked.connect(self._batch_run_try_selected)
     #     batch_ops_layout.addWidget(batch_try_btn)
 
-    #     batch_full_btn = QPushButton("Run Full on Selected")
+    #    batch_full_btn = QPushButton("Run Full on Selected")
     #     batch_full_btn.clicked.connect(self._batch_run_full_selected)
     #     batch_ops_layout.addWidget(batch_full_btn)
 
-    #     self.batch_stop_btn = QPushButton("Stop Queue")
+    #    self.batch_stop_btn = QPushButton("Stop Queue")
     #     self.batch_stop_btn.clicked.connect(self._batch_stop_queue)
     #     self.batch_stop_btn.setEnabled(False)
     #     batch_ops_layout.addWidget(self.batch_stop_btn)
 
     #     batch_ops_layout.addStretch()
 
-    #     remove_selected_btn = QPushButton("Remove Selected from List")
+    #    remove_selected_btn = QPushButton("Remove Selected from List")
     #     remove_selected_btn.clicked.connect(self._batch_remove_selected)
     #     batch_ops_layout.addWidget(remove_selected_btn)
 
     #     main_layout.addLayout(batch_ops_layout)
 
     #     # Progress section
-    #     progress_group = QGroupBox("Batch Progress")
+    #    progress_group = QGroupBox("Batch Progress")
     #     progress_layout = QVBoxLayout()
 
     #     self.batch_progress_bar = QProgressBar()
     #     self.batch_progress_bar.setValue(0)
     #     progress_layout.addWidget(self.batch_progress_bar)
 
-    #     self.batch_status_label = QLabel("Ready")
+    #    self.batch_status_label = QLabel("Ready")
     #     progress_layout.addWidget(self.batch_status_label)
 
     #     progress_group.setLayout(progress_layout)
@@ -2249,7 +2573,7 @@ class TomoGUI(QWidget):
     #     self.batch_available_gpus = []  # List of available GPU IDs
     #     self.batch_total_jobs = 0  # Total number of jobs in current batch
     #     self.batch_completed_jobs = 0  # Number of completed jobs
-    #     self.batch_current_machine = "Local"  # Current machine for batch
+    #    self.batch_current_machine = "Local"  # Current machine for batch
     #     self.batch_current_num_gpus = 1  # Current number of GPUs
 
 
@@ -2279,12 +2603,12 @@ class TomoGUI(QWidget):
                 self.process[:] = [(pp, nn) for (pp, nn) in self.process if pp is not p]
             except Exception:
                 pass
-            self.log_output.append(f"\u2705[{name}] done." if code == 0
-                                else f"\u274c[{name}] failed with code {code}.")
+            self.log_output.append(f"[{name}] done." if code == 0
+                                else f"[{name}] failed with code {code}.")
 
         p.finished.connect(_done)
         p.errorOccurred.connect(
-            lambda _err: self.log_output.append(f"\u274c[{name}] {p.errorString()}")
+            lambda _err: self.log_output.append(f"[{name}] {p.errorString()}")
         )
 
         if not isinstance(self.process, list):
@@ -2300,7 +2624,7 @@ class TomoGUI(QWidget):
             self.canvas.update()
         elif not VISPY_AVAILABLE and self._current_img is not None:
             try:
-                lut = (_mpl_cm.colormaps[self.current_cmap](np.linspace(0, 1, 256)) * 255).astype(np.uint8)
+                lut = (_mpl.colormaps[self.current_cmap](np.linspace(0, 1, 256)) * 255).astype(np.uint8)
                 self._pg_image_item.setLookupTable(lut[:, :3])
                 self._pg_image_item.update()
                 self.canvas_widget.update()
@@ -2327,12 +2651,17 @@ class TomoGUI(QWidget):
             self._pg_apply_levels(self.vmin, self.vmax)
 
     def refresh_current_image(self):
-        if self.full_files and 0 <= self.slice_slider.value() < len(self.full_files):
-            self.show_image(self.full_files[self.slice_slider.value()], flag=None)
-        elif self.preview_files and 0 <= self.slice_slider.value() < len(self.preview_files):
-            self.show_image(self.preview_files[self.slice_slider.value()], flag=None)
-        elif 0<= self.slice_slider.value() < self.raw_files_num:
-            self.show_image(img_path=self.slice_slider.value(), flag="raw")
+        idx = self.slice_slider.value()
+        if self.full_files and 0 <= idx < len(self.full_files):
+            entry = self.full_files[idx]
+            if self.full_h5 is not None:
+                self.show_image(int(entry), flag="full_h5")
+            else:
+                self.show_image(entry, flag=None)
+        elif self.preview_files and 0 <= idx < len(self.preview_files):
+            self.show_image(self.preview_files[idx], flag=None)
+        elif 0 <= idx < self.raw_files_num:
+            self.show_image(img_path=idx, flag="raw")
 
     def highlight_editor(self, editor, event):
         editor.setStyleSheet("QTextEdit { border: 2px solid green; font-size: 12.5pt; }")
@@ -2374,7 +2703,7 @@ class TomoGUI(QWidget):
 
         Returns:
             tuple: (cor_data_dict, list_of_keys)
-                   cor_data_dict uses full file paths as keys
+                    cor_data_dict uses full file paths as keys
         """
         import csv
 
@@ -2401,11 +2730,11 @@ class TomoGUI(QWidget):
                             if full_path:
                                 cor_data[full_path] = cor_value
 
-                self.log_output.append(f'<span style="color:green;">✅ Loaded {len(cor_data)} COR values from batch_cor_values.csv</span>')
+                                self.log_output.append(f'<span style="color:green;">Loaded {len(cor_data)} COR values from batch_cor_values.csv</span>')
                 return cor_data, list(cor_data.keys())
 
             except Exception as e:
-                self.log_output.append(f'<span style="color:red;">❌ Error loading CSV: {e}</span>')
+              self.log_output.append(f'<span style="color:red;">Error loading CSV: {e}</span>')
 
         # Try JSON if CSV doesn't exist or failed
         if os.path.exists(json_path):
@@ -2417,14 +2746,14 @@ class TomoGUI(QWidget):
                         k: str(v[0]) if isinstance(v, list) and v else str(v)
                         for k, v in raw.items()
                     }
-                    self.log_output.append(f'<span style="color:green;">✅ Loaded {len(cor_data)} COR values from rot_cen.json</span>')
+                    self.log_output.append(f'<span style="color:green;">Loaded {len(cor_data)} COR values from rot_cen.json</span>')
                     return cor_data, list(cor_data.keys())
             except json.JSONDecodeError as e:
-                self.log_output.append(f'<span style="color:red;">❌ Error loading rot_cen.json: {e}</span>')
-                return {}, []
+              self.log_output.append(f'<span style="color:red;">Error loading rot_cen.json: {e}</span>')
+              return {}, []
 
         # No COR file found
-        self.log_output.append('<span style="color:orange;">⚠️  No COR file found (checked batch_cor_values.csv and rot_cen.json)</span>')
+              self.log_output.append('<span style="color:orange;"> No COR file found (checked batch_cor_values.csv and rot_cen.json)</span>')
         return {}, []
 
     def refresh_main_table(self):
@@ -2442,7 +2771,7 @@ class TomoGUI(QWidget):
             )
             if reply == QMessageBox.No:
                 return
-            self.log_output.append(f'<span style="color:orange;">⚠️  Refreshed file list while queue was running - status updates may be lost</span>')
+                self.log_output.append(f'<span style="color:orange;"> Refreshed file list while queue was running - status updates may be lost</span>')
         h5_files = sorted(glob.glob(os.path.join(table_folder, "*.h5")), key=os.path.getmtime, reverse=True)
         self.batch_file_main_table.setSortingEnabled(False)
         self.batch_file_main_table.setRowCount(0)
@@ -2460,16 +2789,17 @@ class TomoGUI(QWidget):
             #check recon status
             proj_name = os.path.splitext(filename)[0]
             try_dir = os.path.join(f"{table_folder}_rec", "try_center", proj_name)
-            full_dir = os.path.join(f"{table_folder}_rec", f"{proj_name}_rec")
             has_try = os.path.isdir(try_dir) and len(glob.glob(os.path.join(try_dir, "*.tiff"))) > 0
-            has_full = os.path.isdir(full_dir) and len(glob.glob(os.path.join(full_dir, "*.tiff"))) > 0
+            full_info = self._resolve_full_recon(table_folder, proj_name)
+            has_full = full_info['kind'] is not None
             # Determine row color based on reconstruction status
             if has_full:
                 row_color = "green"  # Full reconstruction exists
-                fp = glob.glob(os.path.join(full_dir, "*.tiff"))
-                num_1 = int(Path(fp[0]).stem.split("_")[-1])
-                num_2 = int(Path(fp[-1]).stem.split("_")[-1])
-                status_item = QTableWidgetItem(f"Full {num_1}-{num_2}")
+                if full_info['range'] is not None:
+                    num_1, num_2 = full_info['range']
+                    status_item = QTableWidgetItem(f"Full {num_1}-{num_2}")
+                else:
+                  status_item = QTableWidgetItem(f"Full ({full_info['kind']})")
             elif has_try:
                 row_color = "orange"  # Only try reconstruction exists
                 status_item = QTableWidgetItem("Done try")
@@ -2598,18 +2928,18 @@ class TomoGUI(QWidget):
                     for full_path, cor_value in sorted(cor_data_dict.items()):
                         filename = os.path.basename(full_path)
                         writer.writerow([filename, cor_value])
-                self.log_output.append(f'<span style="color:green;">✔ COR values saved to CSV</span>')
+                        self.log_output.append(f'<span style="color:green;">COR values saved to CSV</span>')
             except Exception as e:
-                self.log_output.append(f'<span style="color:red;">❌ Failed to write CSV: {e}</span>')
+              self.log_output.append(f'<span style="color:red;">Failed to write CSV: {e}</span>')
 
         # Always save to JSON (current format)
         try:
             with open(json_path, "w") as f:
                 json.dump(cor_data_dict, f, indent=2)
             if not csv_exists:
-                self.log_output.append(f'<span style="color:green;">✔ COR values saved to JSON</span>')
+              self.log_output.append(f'<span style="color:green;">COR values saved to JSON</span>')
         except Exception as e:
-            self.log_output.append(f'<span style="color:red;">❌ Failed to write JSON: {e}</span>')
+          self.log_output.append(f'<span style="color:red;">Failed to write JSON: {e}</span>')
 
     # ===== PER-DATASET RECONSTRUCTION PARAMS =====
 
@@ -2702,7 +3032,7 @@ class TomoGUI(QWidget):
                         if include_cb is not None and entry.get("include") is not None:
                             include_cb.setChecked(bool(entry["include"]))
         except Exception as e:
-            self.log_output.append(f'<span style="color:orange;">⚠️ Error applying params: {e}</span>')
+          self.log_output.append(f'<span style="color:orange;">Error applying params: {e}</span>')
 
     def _load_recon_params_file(self, data_folder):
         """Load recon_params.json from data folder. Returns dict keyed by full file path."""
@@ -2712,7 +3042,7 @@ class TomoGUI(QWidget):
                 with open(path, "r") as f:
                     return json.load(f)
             except Exception as e:
-                self.log_output.append(f'<span style="color:orange;">⚠️ Could not load recon_params.json: {e}</span>')
+              self.log_output.append(f'<span style="color:orange;">Could not load recon_params.json: {e}</span>')
         return {}
 
     def _save_recon_params_file(self, data_folder, params_dict):
@@ -2722,7 +3052,7 @@ class TomoGUI(QWidget):
             with open(path, "w") as f:
                 json.dump(params_dict, f, indent=2)
         except Exception as e:
-            self.log_output.append(f'<span style="color:red;">❌ Could not save recon_params.json: {e}</span>')
+          self.log_output.append(f'<span style="color:red;">Could not save recon_params.json: {e}</span>')
 
     def _save_current_scan_params(self):
         """Save current GUI params for the highlighted scan to recon_params.json."""
@@ -2754,20 +3084,34 @@ class TomoGUI(QWidget):
         target_path = os.path.join(data_folder, "recon_params.json")
 
         def _writer():
+            import sys
+            import tempfile
+            tmp = None
             try:
-                tmp = target_path + ".tmp"
-                with open(tmp, "w") as fh:
+                # Unique tmp filename per thread avoids races when several
+                # writer threads are in flight against the same target.
+                fd, tmp = tempfile.mkstemp(prefix="recon_params.",
+                                          suffix=".tmp",
+                                            dir=data_folder)
+                with os.fdopen(fd, "w") as fh:
                     json.dump(to_write, fh, indent=2)
                 os.replace(tmp, target_path)
+                tmp = None
             except Exception as exc:
                 # Background thread — can't touch GUI directly. Print to
                 # stderr so it shows up in the launching shell / log file.
                 print(f"[tomogui] background param save failed: {exc}",
                       file=sys.stderr)
+            finally:
+                if tmp and os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
         import threading
         t = threading.Thread(target=_writer, daemon=True,
-                             name="recon-params-saver")
+                            name="recon-params-saver")
         t.start()
 
     def _load_scan_params(self, proj_file):
@@ -2779,7 +3123,7 @@ class TomoGUI(QWidget):
             self._recon_params_data = self._load_recon_params_file(data_folder)
         if proj_file in self._recon_params_data:
             self._apply_params_to_gui(self._recon_params_data[proj_file])
-            self.log_output.append(f'✅ Loaded params for {os.path.basename(proj_file)}')
+            self.log_output.append(f'Loaded params for {os.path.basename(proj_file)}')
 
     def _apply_series_tint(self):
         """Shade the filename cell (column 1) and the COR cell (column 2) with
@@ -2834,36 +3178,86 @@ class TomoGUI(QWidget):
         # One summary log line so it's visible if something went wrong
         try:
             self.log_output.append(
-                f'<span style="color:#888;">🎨 series tint applied — '
+              f'<span style="color:#888;">series tint applied — '
                 f'{n_series} series across {n_rows} rows</span>'
             )
         except Exception:
             pass
 
+    def _resolve_full_recon(self, data_folder, proj_name):
+        """Locate the full reconstruction for one dataset.
+
+        Tomocupy's default output is a single ``.h5`` file
+        (``{data}_rec/{proj}_rec.h5``, with the volume at ``/exchange/data``).
+        Legacy TIFF output lives at ``{data}_rec/{proj}_rec/*.tiff``.
+
+        Returns a dict::
+
+            {'kind': 'h5' | 'tiff' | None,
+            'h5_path': str | None,
+            'tiff_files': list[str],
+            'n_slices': int,
+            'range': (first, last) | None}
+
+        The dict is always populated; missing pieces are None / [] / 0. If
+        both TIFF and H5 exist we prefer H5 (that's the new default).
+        """
+        result = {'kind': None, 'h5_path': None, 'tiff_files': [],
+                    'n_slices': 0, 'range': None}
+        if not data_folder or not proj_name:
+            return result
+        base = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
+        h5_path = f"{base}.h5"
+        if os.path.isfile(h5_path):
+            try:
+                with h5py.File(h5_path, 'r') as fh:
+                    n = int(fh['/exchange/data'].shape[0])
+                result.update(kind='h5', h5_path=h5_path,
+                              n_slices=n, range=(0, max(0, n - 1)))
+                return result
+            except (OSError, KeyError):
+                pass
+        if os.path.isdir(base):
+            tiffs = sorted(glob.glob(os.path.join(base, "*.tiff")))
+            if tiffs:
+                try:
+                    n1 = int(Path(tiffs[0]).stem.split("_")[-1])
+                    n2 = int(Path(tiffs[-1]).stem.split("_")[-1])
+                except (ValueError, IndexError):
+                    n1, n2 = 0, len(tiffs) - 1
+                result.update(kind='tiff', tiff_files=tiffs,
+                              n_slices=len(tiffs), range=(n1, n2))
+        return result
+
     def _auto_contrast_for_file(self, proj_file, lo_pct=5, hi_pct=95):
         """Compute (vmin, vmax) as formatted strings from the 5–95 % percentile
         of a representative slice of the reconstructed volume. Returns
-        (None, None) if no TIFFs are available.
+        (None, None) if no reconstruction is available.
 
-        Prefers the full reconstruction (`{data}_rec/{proj}_rec/*.tiff`) —
-        that's what tomolog uploads. Falls back to the try-center TIFFs if
-        full is not available.
+        Prefers the full reconstruction (H5 first, then legacy TIFF dir) —
+        that's what tomolog uploads. Falls back to the try-center TIFFs
+        if full is not available.
         """
         data_folder = self.data_path.text().strip()
         if not data_folder:
             return (None, None)
         proj_name = os.path.splitext(os.path.basename(proj_file))[0]
-        full_dir = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
-        tiffs = sorted(glob.glob(os.path.join(full_dir, "*.tiff")))
-        if not tiffs:
-            try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
-            tiffs = sorted(glob.glob(os.path.join(try_dir, "*.tiff")))
-        if not tiffs:
-            return (None, None)
-        # Take the middle slice as representative
-        mid_path = tiffs[len(tiffs) // 2]
         try:
-            arr = np.array(Image.open(mid_path)).astype(np.float32)
+            info = self._resolve_full_recon(data_folder, proj_name)
+            if info['kind'] == 'h5':
+                with h5py.File(info['h5_path'], 'r') as fh:
+                    dset = fh['/exchange/data']
+                    mid = dset.shape[0] // 2
+                    arr = np.asarray(dset[mid], dtype=np.float32)
+            elif info['kind'] == 'tiff':
+                mid_path = info['tiff_files'][len(info['tiff_files']) // 2]
+                arr = np.array(Image.open(mid_path)).astype(np.float32)
+            else:
+                try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
+                tiffs = sorted(glob.glob(os.path.join(try_dir, "*.tiff")))
+                if not tiffs:
+                    return (None, None)
+                arr = np.array(Image.open(tiffs[len(tiffs) // 2])).astype(np.float32)
             lo = float(np.percentile(arr, lo_pct))
             hi = float(np.percentile(arr, hi_pct))
             if hi <= lo:
@@ -2936,7 +3330,7 @@ class TomoGUI(QWidget):
 
         if n_skipped:
             self.log_output.append(
-                f'<span style="color:#888;">🗑 auto-skipped {n_skipped} file(s) with '
+              f'<span style="color:#888;">auto-skipped {n_skipped} file(s) with '
                 f'size &lt; {pct:g}% of their series median.</span>'
             )
 
@@ -2961,8 +3355,8 @@ class TomoGUI(QWidget):
         try:
             float(txt)
         except ValueError:
-            self.log_output.append(f'<span style="color:red;">❌ Invalid COR "{txt}" for {os.path.basename(file_path)}</span>')
-            return
+          self.log_output.append(f'<span style="color:red;">Invalid COR "{txt}" for {os.path.basename(file_path)}</span>')
+          return
 
         # Update in-memory data
         self.cor_data[file_path] = txt
@@ -3041,8 +3435,8 @@ class TomoGUI(QWidget):
                 with open(fn, "a") as f:
                     json.dump(params, f, indent=2)
             except Exception as e:
-                self.log_output.append(f'\u274c Failed to save params to {fn}: {e}')
-        self.log_output.append(f'\u2705 Saved enabled params to {fn}')
+                self.log_output.append(f'Failed to save params to {fn}: {e}')
+        self.log_output.append(f'Saved enabled params to {fn}')
 
     def load_params_from_file(self):
         start_dir = self.data_path.text().strip()
@@ -3057,14 +3451,14 @@ class TomoGUI(QWidget):
         if dialog.exec():
             load_fn = dialog.selectedFiles()[0]
         if not load_fn or not os.path.isfile(load_fn):
-            self.log_output.append(f'<span style="color:red;">\u274c Invalid file: {load_fn}</span>')
-            return
+          self.log_output.append(f'<span style="color:red;">Invalid file: {load_fn}</span>')
+          return
         with open(load_fn, "r") as f:
             try:
                 params = json.load(f)
             except Exception as e:
-                self.log_output.append(f'<span style="color:red;">\u274c Failed to load params from {load_fn}: {e}</span>')
-                return
+              self.log_output.append(f'<span style="color:red;">Failed to load params from {load_fn}: {e}</span>')
+              return
         for key, v in params.items():
             for widgets in [self.param_widgets, self.phase_widgets, self.Geometry_widgets,
                             self.bhard_widgets, self.rings_widgets, self.perf_widgets, self.data_widgets]:   
@@ -3093,19 +3487,24 @@ class TomoGUI(QWidget):
                                 w.setValue(fv)
                         except Exception:
                             pass
-        self.log_output.append(f'\u2705 Loaded params from {load_fn}')
+        self.log_output.append(f'Loaded params from {load_fn}')
 
     def clear_log(self):
         self.log_output.clear()
 
     def save_log(self):
+        start_dir = self.data_path.text().strip()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_fn = f"Process_log_{timestamp}.txt"
-        if not os.path.exists(log_fn):
-            with open(log_fn, "a", encoding="utf-8") as f:  
-                for line in self.log_output:
-                    f.write(f"{line}\n")
-            self.log_output.append(f'\u2705 Saved log to {log_fn}')
+        log_fn = f"{start_dir}/Process_log_{timestamp}.txt"
+        if os.path.exists(log_fn):
+            return
+        # QTextEdit isn't iterable; pull its plain text contents.
+        text = self.log_output.toPlainText()
+        with open(log_fn, "w", encoding="utf-8") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+                f.write("\n")
+        self.log_output.append(f'Saved log to {log_fn}')
 
 
     def preset_beamhardening(self):
@@ -3162,8 +3561,8 @@ class TomoGUI(QWidget):
 
     def abort_process(self):
         if not self.process:
-            self.log_output.append('<span style="color:red;">\u2139\ufe0f No running process.</span>')
-            return
+          self.log_output.append('<span style="color:red;">No running process.</span>')
+          return
 
         for p, name in list(self.process):
             if p.state() != QProcess.NotRunning:
@@ -3174,7 +3573,7 @@ class TomoGUI(QWidget):
                 if not p.waitForFinished(2000):
                     p.kill()
                     p.waitForFinished(2000)
-            self.log_output.append(f'<span style="color:red;">\u26d4 [{name}] aborted.</span>')
+                    self.log_output.append(f'<span style="color:red;">\u26d4 [{name}] aborted.</span>')
 
         self.process.clear()
         self.batch_running = False
@@ -3199,6 +3598,12 @@ class TomoGUI(QWidget):
             job_label = "job"
         name = f"{job_label}-{scan_id}" if scan_id else job_label
 
+        # Wrap with `env HDF5_USE_FILE_LOCKING=FALSE` so it's set at the shell
+        # level too — QProcessEnvironment.systemEnvironment().insert has been
+        # observed to be swallowed on some Linux/PyQt combos. Belt-and-braces.
+        if cmd and cmd[0] != "env":
+            cmd = ["env", "HDF5_USE_FILE_LOCKING=FALSE"] + list(cmd)
+
         cli_str = " ".join(map(str, cmd))
         self.log_output.append(f'\U0001f680 [{name}] start: {cli_str}')
         QApplication.processEvents()
@@ -3210,6 +3615,12 @@ class TomoGUI(QWidget):
         env = QProcessEnvironment.systemEnvironment()
         if cuda_devices is not None:
             env.insert("CUDA_VISIBLE_DEVICES", str(cuda_devices))
+        # NFS-hosted data (e.g. /data2, /data3) rejects HDF5's default BSD
+        # file locks with EAGAIN, so tomocupy fails to create the output
+        # H5 with "Resource temporarily unavailable". Disable HDF5 file
+        # locking in the child; single-writer semantics are enforced by
+        # tomogui not launching concurrent recons on the same file.
+        env.insert("HDF5_USE_FILE_LOCKING", "FALSE")
         p.setProcessEnvironment(env)
         
         loop = QEventLoop() if wait else None
@@ -3221,7 +3632,7 @@ class TomoGUI(QWidget):
             except Exception:
                 pass
             if code != 0:
-                self.log_output.append(f'<span style="color:red;">\u274c [{name}] failed, check terminal</span>')
+                self.log_output.append(f'<span style="color:red;">[{name}] failed, check terminal</span>')
             result["code"] = code
             if loop is not None:
                 loop.quit()
@@ -3238,7 +3649,7 @@ class TomoGUI(QWidget):
             except RuntimeError:
                 msg = str(_err)
             self.log_output.append(
-                f'<span style="color:red;">\u274c [{name}] {msg}</span>'
+              f'<span style="color:red;">[{name}] {msg}</span>'
             )
 
         p.finished.connect(on_finished)
@@ -3264,8 +3675,8 @@ class TomoGUI(QWidget):
     def _update_row(self,row,color,status):
         row = self.highlight_row
         if row is None:
-            self.log_output.append(f'<span style="color:red;">\u274c No row highlighted</span>')
-            return
+          self.log_output.append(f'<span style="color:red;">No row highlighted</span>')
+          return
         self.batch_file_main_list[row]['recon_status'] = color
         checkbox_widget = self.batch_file_main_table.cellWidget(row, 0)
         if checkbox_widget:
@@ -3317,7 +3728,7 @@ class TomoGUI(QWidget):
     def try_reconstruction(self):
         proj_file = self.highlight_scan
         if not proj_file:
-            self.log_output.append(f"\u274c No file")
+            self.log_output.append(f"No file")
             return
         # Snapshot current GUI params for this file before running.
         self._persist_params_for_files([proj_file])
@@ -3326,23 +3737,23 @@ class TomoGUI(QWidget):
         cor_val = self.cor_input.text().strip()
         if cor_method == "auto":
             if cor_val:
-                self.log_output.append(f'<span style="color:orange;">\u274c use auto method, ignore input cor</span>')
-                pass
+              self.log_output.append(f'<span style="color:orange;">use auto method, ignore input cor</span>')
+              pass
         else:
             try:
                 cor = float(cor_val)
             except ValueError:
-                self.log_output.append(f'<span style="color:red;">\u274c wrong rotation axis input</span>')
-                return
+              self.log_output.append(f'<span style="color:red;">wrong rotation axis input</span>')
+              return
         # cuda for tomocupy try
         gpu = str(self.cuda_box_try.value())
         #add check box for config, seperate from selecting parameters from GUI
         if self.use_conf_box.isChecked():
-            self.log_output.append("\u26a0\ufe0f You are using config file, only recon type, filename, rot axis from GUI")
+            self.log_output.append("You are using config file, only recon type, filename, rot axis from GUI")
             config_text = self.config_editor_try.toPlainText()
             if not config_text.strip():
-                self.log_output.append(f'<span style="color:red;">\u26a0\ufe0f no text in conf, stop</span>')
-                return
+              self.log_output.append(f'<span style="color:red;">no text in conf, stop</span>')
+              return
             temp_try = os.path.join(self.data_path.text(), "temp_try.conf")
             with open(temp_try, "w") as f:
                 f.write(config_text)
@@ -3357,7 +3768,7 @@ class TomoGUI(QWidget):
                 cmd += ["--rotation-axis-auto", "manual",
                         "--rotation-axis", str(cor)]
         else:
-            self.log_output.append('\u26a0\ufe0f You are using params from GUI')
+            self.log_output.append('You are using params from GUI')
             # Base command
             cmd = ["tomocupy", str(recon_way), 
                 "--reconstruction-type", "try", 
@@ -3381,11 +3792,11 @@ class TomoGUI(QWidget):
         try:
             if code == 0:
                 self._update_row(row=self.highlight_row,color='orange',status='Done try') #change table content and self.batch_file_list
-                self.log_output.append(f'<span style="color:green;">\u2705 Done try recon {proj_file}</span>')
+                self.log_output.append(f'<span style="color:green;">Done try recon {proj_file}</span>')
                 return True
             else:
-                self.log_output.append(f'<span style="color:red;">\u274c Try recon {proj_file} failed</span>')
-                return False
+              self.log_output.append(f'<span style="color:red;">Try recon {proj_file} failed</span>')
+              return False
         finally:
             if self.use_conf_box.isChecked():
                 try:
@@ -3393,204 +3804,152 @@ class TomoGUI(QWidget):
                         os.remove(temp_try)
                         self.log_output.append(f"\U0001f9f9 Removed {temp_try}")
                 except Exception as e:
-                    self.log_output.append(f'<span style="color:red;">\u26a0\ufe0f Could not remove {temp_try}: {e}</span>')
+                  self.log_output.append(f'<span style="color:red;">Could not remove {temp_try}: {e}</span>')
 
     def try_ai_reconstruction(self):
-        if self.highlight_scan:
-            self._persist_params_for_files([self.highlight_scan])
-        """Run Try reconstruction then AI inference to find best COR.
+        """Run Try + AI-COR (in a single tomocupy call) then Full recon.
+
+        The AI center-of-rotation search now lives inside tomocupy itself
+        (``--rotation-axis-method ai``), so we no longer run a separate
+        inference subprocess against the try TIFFs. Tomocupy performs the
+        try reconstruction, caches the slices internally, runs the AI
+        inference, and writes ``center_of_rotation.txt`` in the try output
+        directory. We then read that file and launch the full recon.
 
         Starting-COR policy: prefer the currently-highlighted row's COR if it
         is a valid number; otherwise fall back to the top-bar Try COR input.
-        This applies to both single-file and batch invocations."""
-        import re
-        from argparse import Namespace
-        from PIL import Image as _PIL_Image
+        """
+        proj_file = self.highlight_scan
+        if not proj_file:
+            self.log_output.append("No file")
+            return
+        # Blank the viewer FIRST so nothing in the GUI keeps an NFS handle
+        # on the H5 tomocupy is about to overwrite in the Full stage.
+        self._blank_viewer()
+        QApplication.processEvents()
+        self._release_full_h5_for_write(proj_file)
+        QApplication.processEvents()
+        self._persist_params_for_files([proj_file])
 
         model_path = self.ai_model_path.text().strip()
         if not model_path or not os.path.exists(model_path):
-            self.log_output.append('<span style="color:red;">❌ Invalid AI model path</span>')
+            self.log_output.append('<span style="color:red;">Invalid AI model path</span>')
             return
 
-        # Resolve the starting COR: row first, then top-bar.
+        # Resolve the starting COR seed: row first, then top-bar.
         row_cor = ""
         if self.highlight_row is not None:
             w = self.batch_file_main_table.cellWidget(self.highlight_row, 2)
             if w is not None:
                 row_cor = w.text().strip()
         bar_cor = self.cor_input.text().strip()
-        chosen_cor = row_cor or bar_cor
-        if chosen_cor and self.cor_method_box.currentText() != "auto":
-            # Mirror the chosen value into the top-bar so try_reconstruction()
-            # (which reads self.cor_input) uses the right starting guess.
-            self._cor_input_prev = bar_cor
-            self.cor_input.setText(chosen_cor)
+        seed = row_cor or bar_cor
+        if seed:
+            try:
+                float(seed)
+            except ValueError:
+                seed = ""
+        if seed:
             self.log_output.append(
-                f'🤖 AI Reco starting COR = <b>{chosen_cor}</b>  '
-                f'(source: {"row" if row_cor else "top-bar"})'
+                f'AI Reco seed COR = <b>{seed}</b> '
+              f'(source: {"row" if row_cor else "top-bar"})'
             )
+
+        # Wipe any stale center_of_rotation.txt so we only read this run's
+        # result. Tomocupy appends, so leftover values would confuse the
+        # last-line parse below.
+        data_folder = self.data_path.text().strip()
+        proj_name = os.path.splitext(os.path.basename(proj_file))[0]
+        try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
+        stale = os.path.join(try_dir, "center_of_rotation.txt")
+        if os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+
+        recon_way = self.recon_way_box.currentText()
+        gpu = str(self.cuda_box_try.value())
+        if self.use_conf_box.isChecked():
+            self.log_output.append("You are using config file, only recon type, filename, rot axis from GUI")
+            config_text = self.config_editor_try.toPlainText()
+            if not config_text.strip():
+                self.log_output.append('<span style="color:red;">no text in conf, stop</span>')
+                return
+            temp_try = os.path.join(self.data_path.text(), "temp_try.conf")
+            with open(temp_try, "w") as f:
+                f.write(config_text)
+            cmd = ["tomocupy", str(recon_way),
+                  "--reconstruction-type", "try",
+                  "--config", temp_try,
+                  "--file-name", proj_file,
+                  "--rotation-axis-auto", "auto"]
+            if seed:
+                cmd += ["--rotation-axis", seed]
         else:
-            self._cor_input_prev = None
+            cmd = ["tomocupy", str(recon_way),
+                  "--reconstruction-type", "try",
+                  "--file-name", proj_file,
+                  "--rotation-axis-auto", "auto"]
+            if seed:
+                cmd += ["--rotation-axis", seed]
+            cmd += self._gather_params_args()
+            cmd += self._gather_rings_args()
+            cmd += self._gather_bhard_args()
+            cmd += self._gather_phase_args()
+            cmd += self._gather_Geometry_args()
+            cmd += self._gather_Data_args()
+            cmd += self._gather_Performance_args()
+            temp_try = None
 
-        # Step 1: run regular try reconstruction (blocks until done)
-        ok = self.try_reconstruction()
+        # Apply AI-COR flags LAST so they win the argparse last-wins race
+        # against any --rotation-axis-method the Reconstruction tab emitted.
+        cmd = self._apply_ai_cor(cmd)
 
-        # Step 2: locate the output TIFFs
-        proj_file = self.highlight_scan
-        if not proj_file:
-            return
-        data_folder = self.data_path.text().strip()
-        proj_name = os.path.splitext(os.path.basename(proj_file))[0]
-        try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
-        tiff_files = sorted(glob.glob(os.path.join(try_dir, "*.tiff")))
-        if not tiff_files:
-            self.log_output.append(f'<span style="color:red;">❌ No TIFFs in {try_dir}</span>')
-            return
-
-        # Step 3: load images and extract COR values from filenames
-        img_list = []
-        cor_list = []
-        for tiff in tiff_files:
-            m = re.search(r'center(\d+\.\d+)', os.path.basename(tiff))
-            if not m:
-                continue
-            cor_val = float(m.group(1))
-            arr = np.array(_PIL_Image.open(tiff)).astype(np.float32)
-            img_list.append(arr)
-            cor_list.append(cor_val)
-
-        if not img_list:
-            self.log_output.append('<span style="color:red;">❌ Could not parse COR values from TIFF filenames</span>')
-            return
-
-        img_cache = np.array(img_list)
-        center_of_rotation_cache = np.array(cor_list)
-
-        # Step 4: run inference
-        try:
-            from tomogui._tomocor_infer.inference import inference_pipeline
-        except ImportError as e:
-            self.log_output.append(f'<span style="color:red;">❌ Inference module error: {e}</span>')
-            return
-
-        ai_args = Namespace(
-            infer_use_8bits=True,
-            infer_downsample_factor=2,
-            infer_num_windows=3,
-            infer_seed_number=10,
-            infer_model_path=model_path,
-            infer_window_size=518,
-        )
-
-        self.log_output.append(f'🤖 Running AI inference on {len(img_list)} slices...')
+        self.log_output.append('Try + AI COR search (single tomocupy call)…')
         QApplication.processEvents()
-
         try:
-            inference_pipeline(ai_args, img_cache, center_of_rotation_cache, try_dir)
-            cor_txt = os.path.join(try_dir, 'center_of_rotation.txt')
-            if os.path.exists(cor_txt):
-                with open(cor_txt) as f:
-                    lines = [line.strip() for line in f if line.strip()]
-                if lines:
-                    ai_cor = lines[-1]
-                    float(ai_cor)  # validate
-                    self.cor_data[proj_file] = ai_cor
-                    self._save_cor_data(data_folder, self.cor_data)
-                    if self.highlight_row is not None:
-                        cor_widget = self.batch_file_main_table.cellWidget(self.highlight_row, 2)
-                        if cor_widget:
-                            cor_widget.setText(str(ai_cor))
-                    self.log_output.append(f'<span style="color:green;">✅ AI COR: {ai_cor} — saved for {os.path.basename(proj_file)}</span>')
-                    # Run full reconstruction with the AI-predicted COR
-                    self.log_output.append('🚀 Starting full reconstruction with AI COR...')
-                    QApplication.processEvents()
-                    return self.full_reconstruction()
-						
-                else:
-                    self.log_output.append('<span style="color:orange;">⚠️ center_of_rotation.txt is empty</span>')
-            else:
-                self.log_output.append(f'<span style="color:orange;">⚠️ Output not found: {cor_txt}</span>')
-        except Exception as e:
-            self.log_output.append(f'<span style="color:red;">❌ AI Reco error: {e}</span>')
+            code = self.run_command_live(
+                cmd, proj_file=proj_file, job_label="Try+AI recon",
+                wait=True, cuda_devices=gpu,
+            )
         finally:
-            # Restore the top-bar so a row-specific starting COR we borrowed
-            # earlier doesn't leak into later single-file clicks.
-            if getattr(self, "_cor_input_prev", None) is not None:
-                self.cor_input.setText(self._cor_input_prev)
-                self._cor_input_prev = None
+            if temp_try and os.path.exists(temp_try):
+                try:
+                    os.remove(temp_try)
+                except OSError:
+                    pass
 
-    def _run_ai_inference_for_file(self, proj_file, model_path=None):
-        """Run DINOv2 inference on the existing try-reconstruction TIFFs of
-        one file and write the predicted COR into the row + rot_cen.json.
-        Returns the predicted COR as a string on success, or None on failure.
-        Does NOT run try or full reconstruction — caller is responsible for
-        those (and must have run 'try' first so the TIFFs exist)."""
-        import re as _re
-        from argparse import Namespace as _NS
-        from PIL import Image as _PIL_Image
-        if model_path is None:
-            model_path = self.ai_model_path.text().strip()
-        if not model_path or not os.path.exists(model_path):
-            self.log_output.append('<span style="color:red;">❌ Invalid AI model path</span>')
-            return None
-        data_folder = self.data_path.text().strip()
-        proj_name = os.path.splitext(os.path.basename(proj_file))[0]
-        try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
-        tiff_files = sorted(glob.glob(os.path.join(try_dir, "*.tiff")))
-        if not tiff_files:
+        if code != 0:
             self.log_output.append(
-                f'<span style="color:red;">❌ No TIFFs for {os.path.basename(proj_file)} '
-                f'in {try_dir} — try reconstruction did not run</span>'
+              f'<span style="color:red;">Try+AI failed for {os.path.basename(proj_file)}</span>'
             )
-            return None
-        img_list, cor_list = [], []
-        for tiff in tiff_files:
-            m = _re.search(r'center(\d+\.\d+)', os.path.basename(tiff))
-            if not m:
-                continue
-            cor_list.append(float(m.group(1)))
-            img_list.append(np.array(_PIL_Image.open(tiff)).astype(np.float32))
-        if not img_list:
-            self.log_output.append('<span style="color:red;">❌ Could not parse COR values</span>')
-            return None
-        try:
-            from tomogui._tomocor_infer.inference import inference_pipeline
-        except ImportError as e:
-            self.log_output.append(f'<span style="color:red;">❌ Inference module error: {e}</span>')
-            return None
-        ai_args = _NS(infer_use_8bits=True, infer_downsample_factor=2,
-                      infer_num_windows=3, infer_seed_number=10,
-                      infer_model_path=model_path, infer_window_size=518)
-        try:
-            inference_pipeline(ai_args, np.array(img_list), np.array(cor_list), try_dir)
-        except Exception as e:
+            return
+
+        ai_cor = self._read_ai_cor_from_try_dir(proj_file)
+        if ai_cor is None:
             self.log_output.append(
-                f'<span style="color:red;">❌ AI inference failed for '
-                f'{os.path.basename(proj_file)}: {e}</span>'
+              f'<span style="color:orange;">tomocupy did not produce '
+                f'center_of_rotation.txt in {try_dir}</span>'
             )
-            return None
-        cor_txt = os.path.join(try_dir, 'center_of_rotation.txt')
-        if not os.path.exists(cor_txt):
-            return None
-        with open(cor_txt) as f:
-            lines = [line.strip() for line in f if line.strip()]
-        if not lines:
-            return None
-        ai_cor = lines[-1]
-        try:
-            float(ai_cor)
-        except ValueError:
-            return None
-        # Persist + reflect in the table
-        self.cor_data[proj_file] = ai_cor
+            return
+
+        ai_cor_str = f"{ai_cor:.2f}"
+        self.cor_data[proj_file] = ai_cor_str
         if data_folder:
             self._save_cor_data(data_folder, self.cor_data)
-        row = self._find_row_by_filepath(proj_file)
-        if row is not None:
-            w = self.batch_file_main_table.cellWidget(row, 2)
-            if w is not None:
-                w.setText(str(ai_cor))
-        return ai_cor
+        if self.highlight_row is not None:
+            cor_widget = self.batch_file_main_table.cellWidget(self.highlight_row, 2)
+            if cor_widget:
+                cor_widget.setText(ai_cor_str)
+        self.log_output.append(
+          f'<span style="color:green;">AI COR: {ai_cor_str} — saved for '
+            f'{os.path.basename(proj_file)}</span>'
+        )
+
+        self.log_output.append('Starting full reconstruction with AI COR…')
+        QApplication.processEvents()
+        return self.full_reconstruction()
 
     # ------------------------------------------------------------------ #
     #  Sync Acquisition                                                    #
@@ -3605,9 +3964,9 @@ class TomoGUI(QWidget):
     def _start_sync(self):
         data_folder = self.data_path.text().strip()
         if not data_folder or not os.path.isdir(data_folder):
-            self.log_output.append('<span style="color:red;">❌ Set a valid data folder before starting Sync</span>')
-            self.sync_btn.setChecked(False)
-            return
+          self.log_output.append('<span style="color:red;">Set a valid data folder before starting Sync</span>')
+          self.sync_btn.setChecked(False)
+          return
         known = set(glob.glob(os.path.join(data_folder, "*.h5")))
         self._sync_queue = []
         self._sync_processing = False
@@ -3644,16 +4003,16 @@ class TomoGUI(QWidget):
             self._sync_watcher.stop()
             # give the thread up to 15 s to exit its poll cycle
             if not self._sync_watcher.wait(15000):
-                self.log_output.append('<span style="color:orange;">⚠️ Sync thread did not exit, terminating</span>')
-                self._sync_watcher.terminate()
-                self._sync_watcher.wait(2000)
+              self.log_output.append('<span style="color:orange;">Sync thread did not exit, terminating</span>')
+              self._sync_watcher.terminate()
+              self._sync_watcher.wait(2000)
             self._sync_watcher = None
         
         self._sync_queue = []
         self._sync_processing = False
         self._sync_current_file = None
         
-        self.sync_btn.setText("▶  Sync Acquisition")
+        self.sync_btn.setText(" Sync Acquisition")
         self.sync_btn.setChecked(False)
         self.batch_file_main_table.setEnabled(True)
         self.log_output.append('🔄 Sync Acquisition stopped.')
@@ -3700,19 +4059,20 @@ class TomoGUI(QWidget):
         filename = os.path.basename(filepath)
         proj_name = os.path.splitext(filename)[0]
         try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
-        full_dir = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
         has_try = os.path.isdir(try_dir) and len(glob.glob(os.path.join(try_dir, "*.tiff"))) > 0
-        has_full = os.path.isdir(full_dir) and len(glob.glob(os.path.join(full_dir, "*.tiff"))) > 0
+        full_info = self._resolve_full_recon(data_folder, proj_name)
+        has_full = full_info['kind'] is not None
 
         row = 0  # insert at top (newest first)
         self.batch_file_main_table.insertRow(row)
 
         if has_full:
             row_color, status_text = "green", "Full"
-            fp = glob.glob(os.path.join(full_dir, "*.tiff"))
-            num_1 = int(Path(fp[0]).stem.split("_")[-1])
-            num_2 = int(Path(fp[-1]).stem.split("_")[-1])
-            status_item = QTableWidgetItem(f"{status_text} {num_1}-{num_2}")
+            if full_info['range'] is not None:
+                num_1, num_2 = full_info['range']
+                status_item = QTableWidgetItem(f"{status_text} {num_1}-{num_2}")
+            else:
+              status_item = QTableWidgetItem(f"{status_text} ({full_info['kind']})")
         elif has_try:
             row_color, status_text = "orange", "Done try"
             status_item = QTableWidgetItem(status_text)
@@ -3818,7 +4178,7 @@ class TomoGUI(QWidget):
         self._sync_current_file = filepath
         self._sync_processing = True
         self._add_file_to_table(filepath) #always the first one 
-        self.log_output.append(f'▶ Start sync processing: <b>{os.path.basename(filepath)}</b>')
+        self.log_output.append(f'Start sync processing: <b>{os.path.basename(filepath)}</b>')
         # Select the row so highlight_scan is set correctly
         for row in reversed(range(self.batch_file_main_table.rowCount())):
             item = self.batch_file_main_table.item(row, 1)
@@ -3834,8 +4194,8 @@ class TomoGUI(QWidget):
             self._run_tomolog_for_file(filepath)
         else:
             self.log_output.append(
-                f'<span style="color:red;">❌ Sync reconstruction failed, skipping tomolog: {os.path.basename(filepath)}</span>'
-             )
+              f'<span style="color:red;">Sync reconstruction failed, skipping tomolog: {os.path.basename(filepath)}</span>'
+                )
 
         self._sync_processing = False
         self._sync_current_file = None
@@ -3844,7 +4204,12 @@ class TomoGUI(QWidget):
         self._process_next_sync_file()
         
     def _run_tomolog_for_file(self, filepath):
-        """Run tomolog upload for a specific file using current GUI settings."""
+        """Run tomolog upload for a specific file using current GUI settings.
+
+        If the min/max fields are blank, a per-dataset 5-95 % percentile
+        contrast is computed from the reconstruction — that lets mass /
+        sync uploads adapt contrast automatically. Any value typed by
+        the user overrides the auto-contrast for that bound."""
         beamline = self.beamline_box.currentText()
         cloud = self.cloud_box.currentText()
         url = self.url_input.text().strip()
@@ -3854,6 +4219,23 @@ class TomoGUI(QWidget):
         vmin = self.min_input.text().strip()
         vmax = self.max_input.text().strip()
         note_value = self.get_note_value()
+
+        if not vmin or not vmax:
+            avmin, avmax = self._auto_contrast_for_file(filepath)
+            if not vmin and avmin is not None:
+                vmin = avmin
+            if not vmax and avmax is not None:
+                vmax = avmax
+            if avmin is not None and avmax is not None:
+                self.log_output.append(
+                  f'<span style="color:#888;"> auto contrast '
+                    f'{os.path.basename(filepath)}: min={vmin}, max={vmax}</span>'
+                )
+            else:
+                self.log_output.append(
+                  f'<span style="color:orange;">no reconstruction TIFFs for '
+                    f'{os.path.basename(filepath)} — tomolog will use its own default contrast.</span>'
+                )
 
         cmd = [
             "tomolog", "run",
@@ -3874,13 +4256,13 @@ class TomoGUI(QWidget):
         if extra_params:
             cmd.extend(extra_params.split())
 
-        self.log_output.append(f'📤 Uploading to tomolog: {os.path.basename(filepath)}')
+        self.log_output.append(f'Uploading to tomolog: {os.path.basename(filepath)}')
         QApplication.processEvents()
         code = self.run_command_live(cmd, proj_file=filepath, job_label="tomolog-sync", wait=True, cuda_devices=None)
         if code == 0:
-            self.log_output.append(f'<span style="color:green;">✅ Tomolog upload done: {os.path.basename(filepath)}</span>')
+          self.log_output.append(f'<span style="color:green;">Tomolog upload done: {os.path.basename(filepath)}</span>')
         else:
-            self.log_output.append(f'<span style="color:red;">❌ Tomolog upload failed: {os.path.basename(filepath)}</span>')
+          self.log_output.append(f'<span style="color:red;">Tomolog upload failed: {os.path.basename(filepath)}</span>')
 
     def _update_full_btn_state(self):
         """Grey out Full button only while the currently selected file is running locally."""
@@ -3890,8 +4272,17 @@ class TomoGUI(QWidget):
             self.full_btn.setEnabled(True)
 
     def full_reconstruction(self):
-        self._update_full_btn_state()
+        # STEP 1 (must be first, before anything else): blank the viewer
+        # and flush the paint so the on-screen image is *visibly* gone
+        # before we touch the H5 or launch tomocupy. Otherwise the display
+        # keeps an NFS handle alive on the file we're about to overwrite.
         proj_file = self.highlight_scan
+        self._blank_viewer()
+        QApplication.processEvents()
+        self._release_full_h5_for_write(proj_file)
+        QApplication.processEvents()
+
+        self._update_full_btn_state()
         if proj_file:
             self._persist_params_for_files([proj_file])
         # Mark this file as running locally and grey out button only for it
@@ -3907,35 +4298,35 @@ class TomoGUI(QWidget):
                 try:
                     cor_value = float(self.batch_file_main_list[self.highlight_row]['cor_input'].text().strip())
                 except ValueError:
-                    self.log_output.append('<span style="color:red;">\u274c[ERROR] Invalid Full COR value</span>')
-                    return
+                  self.log_output.append('<span style="color:red;">[ERROR] Invalid Full COR value</span>')
+                  return
             if self.use_conf_box.isChecked():
-                self.log_output.append("\u26a0\ufe0f You are using config file, only recon type, filename, rot axis from GUI")
+                self.log_output.append("You are using config file, only recon type, filename, rot axis from GUI")
                 config_text = self.config_editor_full.toPlainText()
                 if not config_text.strip():
-                    self.log_output.append('<span style="color:red;">\u26a0\ufe0f No text in conf, stop</span>')
-                    return
+                  self.log_output.append('<span style="color:red;">No text in conf, stop</span>')
+                  return
                 temp_full = os.path.join(self.data_path.text(), "temp_full.conf")
                 with open(temp_full, "w") as f:
                     f.write(config_text)
                 cmd = ["tomocupy", str(recon_way),
-                       "--reconstruction-type", "full",
-                       "--config", temp_full,
-                       "--file-name", proj_file,
-                       "--rotation-axis", str(cor_value)]
+                      "--reconstruction-type", "full",
+                      "--config", temp_full,
+                      "--file-name", proj_file,
+                      "--rotation-axis", str(cor_value)]
             else:
-                self.log_output.append('\u26a0\ufe0f You are using params from GUI')
+                self.log_output.append('You are using params from GUI')
                 if cor_method == "auto":
                     cmd = ["tomocupy", str(recon_way),
-                           "--reconstruction-type", "full",
-                           "--file-name", proj_file,
-                           "--rotation-axis-auto", cor_method]
+                          "--reconstruction-type", "full",
+                          "--file-name", proj_file,
+                          "--rotation-axis-auto", cor_method]
                 elif cor_method == "manual":
                     cmd = ["tomocupy", str(recon_way),
-                           "--reconstruction-type", "full",
-                           "--file-name", proj_file,
-                           "--rotation-axis-auto", cor_method,
-                           "--rotation-axis", str(cor_value)]
+                          "--reconstruction-type", "full",
+                          "--file-name", proj_file,
+                          "--rotation-axis-auto", cor_method,
+                          "--rotation-axis", str(cor_value)]
                 cmd += self._gather_params_args()
                 cmd += self._gather_rings_args()
                 cmd += self._gather_bhard_args()
@@ -3947,17 +4338,20 @@ class TomoGUI(QWidget):
             code = self.run_command_live(cmd, proj_file=proj_file, job_label="Full recon", wait=True, cuda_devices=gpu)
             try:
                 if code == 0:
-                    fullpath = os.path.join(f"{self.data_path.text()}_rec", f"{pn}_rec")
-                    full_files = glob.glob(os.path.join(fullpath, "*.tiff"))
-                    num_1 = int(Path(full_files[0]).stem.split("_")[-1])
-                    num_2 = int(Path(full_files[-1]).stem.split("_")[-1])
-                    self._update_row(row=self.highlight_row, color='green', status=f'Full {num_1}-{num_2}')
-                    self.log_output.append(f'<span style="color:green;">\u2705 Done full recon {proj_file}</span>')
-                    del fullpath, full_files, num_1, num_2, pn
+                    info = self._resolve_full_recon(self.data_path.text(), pn)
+                    if info['kind'] and info['range'] is not None:
+                        n1, n2 = info['range']
+                        status = f"Full {n1}-{n2}"
+                    elif info['kind']:
+                      status = f"Full ({info['kind']})"
+                    else:
+                        status = "Done full"
+                    self._update_row(row=self.highlight_row, color='green', status=status)
+                    self.log_output.append(f'<span style="color:green;">Done full recon {proj_file}</span>')
                     return True
                 else:
-                    self.log_output.append(f'<span style="color:red;">\u274c Full recon {proj_file} failed</span>')
-                    return False
+                  self.log_output.append(f'<span style="color:red;">Full recon {proj_file} failed</span>')
+                  return False
             finally:
                 if self.use_conf_box.isChecked():
                     try:
@@ -3965,7 +4359,7 @@ class TomoGUI(QWidget):
                             os.remove(temp_full)
                             self.log_output.append(f"\U0001f9f9 Removed {temp_full}")
                     except Exception as e:
-                        self.log_output.append(f'<span style="color:red;">\u26a0\ufe0f Could not remove {temp_full}: {e}</span>')
+                      self.log_output.append(f'<span style="color:red;">Could not remove {temp_full}: {e}</span>')
         finally:
             if self.use_conf_box.isChecked():
                 try:
@@ -3973,7 +4367,7 @@ class TomoGUI(QWidget):
                         os.remove(temp_full)
                         self.log_output.append(f"\U0001f9f9 Removed {temp_full}")
                 except Exception as e:
-                    self.log_output.append(f'<span style="color:red;">\u26a0\ufe0f Could not remove {temp_full}: {e}</span>')
+                  self.log_output.append(f'<span style="color:red;">Could not remove {temp_full}: {e}</span>')
             self._running_full_file = None
             self._update_full_btn_state()
 		    
@@ -3987,9 +4381,9 @@ class TomoGUI(QWidget):
                 skipped_small += 1
                 continue
             file_info['checkbox'].setChecked(True)
-        msg = '<span style="color:green;">Select all files in table</span>'
+            msg = '<span style="color:green;">Select all files in table</span>'
         if skipped_small:
-            msg += (f' <span style="color:#888;">'
+          msg += (f' <span style="color:#888;">'
                     f'({skipped_small} small-file row(s) kept unchecked)</span>')
         self.log_output.append(msg)
 
@@ -3997,7 +4391,7 @@ class TomoGUI(QWidget):
         """Deselect all files in the batch list"""
         for file_info in self.batch_file_main_list:
             file_info['checkbox'].setChecked(False)
-        self.log_output.append(f'<span style="color:green;">Unselect all files in table</span>')
+            self.log_output.append(f'<span style="color:green;">Unselect all files in table</span>')
 
     def _get_batch_machine_command(self, cmd, machine):
         """
@@ -4027,16 +4421,16 @@ class TomoGUI(QWidget):
 
         # Build command with conda activation
         # Properly quote arguments for shell execution
-        remote_cmd = " ".join([f'"{str(arg)}"' if " " in str(arg) else str(arg) for arg in cmd])
+            remote_cmd = " ".join([f'"{str(arg)}"' if " " in str(arg) else str(arg) for arg in cmd])
 
         # Wrap command with conda activation
-        full_cmd = f"bash -l -c 'source ~/.bashrc && conda activate {conda_env} && {remote_cmd}'"
+            full_cmd = f"bash -l -c 'source ~/.bashrc && conda activate {conda_env} && {remote_cmd}'"
 
         # Use SSH with terminal (-t) to execute the command on the remote machine
         # -t forces pseudo-terminal allocation for better output handling
         ssh_cmd = ["ssh", "-t", ssh_target, full_cmd]
 
-        self.log_output.append(f'<span style="color:gray;">🔗 SSH: {ssh_target} (env: {conda_env})</span>')
+        self.log_output.append(f'<span style="color:gray;">SSH: {ssh_target} (env: {conda_env})</span>')
 
         return ssh_cmd
 
@@ -4051,14 +4445,14 @@ class TomoGUI(QWidget):
         idx = self.slice_slider.value()
         cor_file = self.preview_files[idx]
         if not os.path.exists(proj_file) or not os.path.exists(cor_file):
-            self.log_output.append(f'<span style="color:red;">\u26a0\ufe0fMissing try data folder or projection file</span>')
-            return
+          self.log_output.append(f'<span style="color:red;">Missing try data folder or projection file</span>')
+          return
         cor_nm = os.path.basename(cor_file)
         try:
             cor_value = cor_nm.split("center")[1].split(".tiff")[0]
         except IndexError:
-            self.log_output('<span style="color:red;">\u274c[ERROR] Value not found in expected format, cannot add COR</span>')
-            return
+          self.log_output('<span style="color:red;">[ERROR] Value not found in expected format, cannot add COR</span>')
+          return
         json_path = os.path.join(data_folder, "rot_cen.json")
         if os.path.exists(json_path):
             with open(json_path, "r") as f:
@@ -4080,7 +4474,7 @@ class TomoGUI(QWidget):
             overfn_msg_box.setDefaultButton(QMessageBox.No)
             result = overfn_msg_box.exec()
             if result != QMessageBox.Yes:
-                self.log_output.append("\u26a0\ufe0fNot take COR")
+                self.log_output.append("Not take COR")
                 return
         self.cor_data[proj_file] = cor_value
 
@@ -4097,23 +4491,72 @@ class TomoGUI(QWidget):
         w.setText(str(cor_value))
         # keep list storing the widget
         self.batch_file_main_list[row]['cor_input'] = w
-        self.log_output.append(f"\u2705[INFO] COR saved for: {os.path.basename(proj_file)}")
+        self.log_output.append(f"[INFO] COR saved for: {os.path.basename(proj_file)}")
 
     # ===== IMAGE VIEWING =====
-    def view_try_reconstruction(self):
+    def _preflight_view(self, kind):
+        """Common validation for View Try / View Full. Returns
+        ``(data_folder, proj_file, proj_name)`` on success, or ``None`` on
+        failure \u2014 in which case the viewer is blanked and a red message is
+        printed to the log panel. No modal dialogs."""
         data_folder = self.data_path.text().strip()
-        proj_file = self.highlight_scan #the scan highlighted in main table full path
+        proj_file = self.highlight_scan
+        if not data_folder or not os.path.isdir(data_folder):
+            self._blank_viewer()
+            self.log_output.append(
+              f'<span style="color:red;">View {kind}: no data folder '
+                f'set \u2014 pick a folder in the Main tab first.</span>'
+            )
+            return None
+        if not proj_file:
+            self._blank_viewer()
+            self.log_output.append(
+              f'<span style="color:red;">View {kind}: no file selected '
+                f'\u2014 click a row in the table first.</span>'
+            )
+            return None
+        if not os.path.isfile(proj_file):
+            self._blank_viewer()
+            self.log_output.append(
+              f'<span style="color:red;">View {kind}: source file no '
+                f'longer exists: {proj_file}</span>'
+            )
+            return None
         proj_name = os.path.splitext(os.path.basename(proj_file))[0]
-        try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
-        self.preview_files = [] #clean it before use
-        self.preview_files = sorted(glob.glob(os.path.join(try_dir, "*.tiff")))
-        if not self.preview_files:
-            self.log_output.append(f'<span style="color:red;">\u274c No try reconstruction found in {try_dir}</span>')
+        return data_folder, proj_file, proj_name
+
+    def view_try_reconstruction(self):
+        pf = self._preflight_view("Try")
+        if pf is None:
             return
-        self.log_output.append(f"first: {self.preview_files[0]}; last: {self.preview_files[-1]}")
+        data_folder, proj_file, proj_name = pf
+
+        try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
+        preview_files = sorted(glob.glob(os.path.join(try_dir, "*.tiff")))
+        if not preview_files:
+            self._blank_viewer()
+            base = os.path.basename(proj_file)
+            if not os.path.isdir(try_dir):
+                self.log_output.append(
+                  f'<span style="color:red;">View Try: no try_center '
+                    f'dir for {base} \u2014 expected {try_dir}. Run a Try '
+                    f'reconstruction on this file first.</span>'
+                )
+            else:
+                self.log_output.append(
+                  f'<span style="color:red;">View Try: {try_dir} '
+                    f'exists but has no .tiff slices for {base}.</span>'
+                )
+            return
+
+        self.preview_files = preview_files
+        self.log_output.append(
+            f"Try recon: {os.path.basename(proj_file)} \u2014 {len(preview_files)} "
+            f"slice(s), first {os.path.basename(preview_files[0])}, "
+            f"last {os.path.basename(preview_files[-1])}"
+        )
         self._clear_roi()
         self._reset_view_state()
-        #self.set_image_scale(self.preview_files[0])
         try:
             self.slice_slider.valueChanged.disconnect()
         except TypeError:
@@ -4121,31 +4564,162 @@ class TomoGUI(QWidget):
         self.slice_slider.setMaximum(len(self.preview_files) - 1)
         self.slice_slider.valueChanged.connect(self.update_try_slice)
         self._try_proj_name = proj_name
-        self.update_try_slice()  
+        self.update_try_slice()
 
     def view_full_reconstruction(self):
-        data_folder = self.data_path.text().strip()
-        proj_file = self.highlight_scan
-        proj_name = os.path.splitext(os.path.basename(proj_file))[0]
-        full_dir = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
-        self.full_files = sorted(glob.glob(os.path.join(full_dir, "*.tiff")))
-        if not self.full_files:
-            self.log_output.append(f'<span style="color:red;">\u274c No full reconstruction found in {full_dir}</span>')
+        pf = self._preflight_view("Full")
+        if pf is None:
             return
-        self.log_output.append(f"first: {self.full_files[0]}; last: {self.full_files[-1]}")
+        data_folder, proj_file, proj_name = pf
+
+        info = self._resolve_full_recon(data_folder, proj_name)
+
+        # Close any previously-open H5 handle before switching source.
+        self._close_full_h5()
+
+        if info['kind'] == 'h5':
+            try:
+                # locking=False avoids grabbing an OS lock the writer
+                # (tomocupy) would otherwise get EAGAIN on when the user
+                # relaunches Full recon on the same file over NFS.
+                try:
+                    self.full_h5 = h5py.File(info['h5_path'], 'r',
+                                                locking=False)
+                except (TypeError, ValueError):
+                    self.full_h5 = h5py.File(info['h5_path'], 'r')
+            except OSError as e:
+                self._blank_viewer()
+                self.log_output.append(
+                  f'<span style="color:red;">View Full: could not open '
+                  f'{info["h5_path"]}: {e}</span>'
+                )
+                return
+            self.full_h5_path = info['h5_path']
+            n = info['n_slices']
+            if n <= 0:
+                self._close_full_h5()
+                self._blank_viewer()
+                self.log_output.append(
+                  f'<span style="color:red;">View Full: H5 exists but '
+                  f'/exchange/data is empty: {info["h5_path"]}</span>'
+                )
+                return
+            self.full_files = list(range(n))
+            self.log_output.append(
+              f'\ud83d\udce6 Full recon: {os.path.basename(info["h5_path"])} '
+                f'({n} slices)'
+            )
+        elif info['kind'] == 'tiff':
+            self.full_files = info['tiff_files']
+            self.log_output.append(
+                f"Full recon: {len(self.full_files)} tiff(s), first "
+                f"{os.path.basename(self.full_files[0])}, last "
+                f"{os.path.basename(self.full_files[-1])}"
+            )
+        else:
+            self._blank_viewer()
+            base = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
+            self.log_output.append(
+              f'<span style="color:red;">View Full: no reconstruction '
+                f'for {os.path.basename(proj_file)} \u2014 checked {base}.h5 and '
+                f'{base}/*.tiff. Run a Full reconstruction first.</span>'
+            )
+            return
+
         self._clear_roi()
         self._reset_view_state()
-        #self.set_image_scale(self.full_files[0])
         try:
             self.slice_slider.valueChanged.disconnect()
         except TypeError:
             pass
-        self.slice_slider.setMaximum(len(self.full_files) - 1)
+        self.slice_slider.setMaximum(max(0, len(self.full_files) - 1))
         self.slice_slider.valueChanged.connect(self.update_full_slice)
-        # Store the source filename for display
         self._current_source_file = os.path.basename(proj_file)
         self._current_view_mode = "full"
         self.update_full_slice()
+
+    def _close_full_h5(self):
+        """Close any open full-recon H5 handle. Safe to call repeatedly."""
+        if self.full_h5 is not None:
+            try:
+                self.full_h5.close()
+            except OSError:
+                pass
+        self.full_h5 = None
+        self.full_h5_path = None
+
+    def _blank_viewer(self):
+        """Clear the on-screen image and drop every reference to the file
+        it was loaded from. Called before a Full recon so the display can't
+        keep an NFS handle alive on the file tomocupy is about to overwrite.
+        """
+        # Drop file-list state so slider handlers can't try to reopen the
+        # old paths after we've torn everything down.
+        self.full_files = []
+        self.preview_files = []
+        self._current_img = None
+        self._current_img_path = None
+        try:
+            self.slice_slider.valueChanged.disconnect()
+        except TypeError:
+            pass
+        self.slice_slider.setMaximum(0)
+        self.slice_slider.setValue(0)
+        try:
+            self.filename_label.setText("")
+        except (AttributeError, RuntimeError):
+            pass
+        self._clear_roi()
+        self._reset_view_state()
+
+        # Replace the pixels with an empty 1×1 array so the widget shows
+        # blank instead of the last frame from the file we're about to
+        # overwrite. Guarded because either renderer may be unavailable.
+        blank = np.zeros((1, 1), dtype=np.float32)
+        if VISPY_AVAILABLE and hasattr(self, 'image_visual'):
+            try:
+                self.image_visual.set_data(blank)
+                self.canvas.update()
+            except (ValueError, RuntimeError, AttributeError):
+                pass
+        elif hasattr(self, '_pg_image_item'):
+            try:
+                self._pg_image_item.setImage(blank, autoLevels=False)
+                self._pg_image_item.update()
+            except (ValueError, TypeError, RuntimeError, AttributeError):
+                pass
+
+    def _middle_of_width(self, proj_file):
+        """Return image_width / 2 read from ``proj_file`` (/exchange/data
+        shape is (nproj, nz, nx)). Used as the AI-COR fallback seed when
+        neither the row nor the top-bar carries a valid number. Returns
+      ``None`` if the file can't be opened or the dataset is missing."""
+        if not proj_file or not os.path.isfile(proj_file):
+            return None
+        try:
+            with h5py.File(proj_file, 'r') as fh:
+                shape = fh['/exchange/data'].shape
+        except (OSError, KeyError):
+            return None
+        if len(shape) < 3:
+            return None
+        return float(shape[2]) / 2.0
+
+    def _release_full_h5_for_write(self, proj_file):
+        """Blank the viewer and drop any H5 handle it holds so tomocupy can
+        overwrite the file without colliding with the GUI's reader.
+
+        Tomocupy's own ``--clear-folder`` step handles removing/truncating
+        the output on disk — we do NOT touch files here (an earlier version
+        deleted them and destroyed valid reconstructions when the new run
+        crashed)."""
+        was_holding = self.full_h5 is not None or bool(self.full_files) or bool(self.preview_files)
+        self._blank_viewer()
+        if was_holding:
+            self.log_output.append(
+                '<span style="color:#888;">Cleared viewer before '
+                'Full recon.</span>'
+            )
 
     def set_image_scale(self, img_path, flag=None):
         if flag == "raw":
@@ -4160,7 +4734,7 @@ class TomoGUI(QWidget):
     def draw_box(self):
         """Enable interactive ROI drawing."""
         if self._current_img is None:
-            self.log_output.append("\u26a0\ufe0f No image loaded to draw box.")
+            self.log_output.append("No image loaded to draw box.")
             return
 
         if not VISPY_AVAILABLE:
@@ -4169,7 +4743,7 @@ class TomoGUI(QWidget):
             if self._pg_roi_item is not None:
                 self._pg_view_box.removeItem(self._pg_roi_item)
             self._pg_roi_item = pg.RectROI([w // 4, h // 4], [w // 2, h // 2],
-                                           pen=pg.mkPen('r', width=2))
+                                          pen=pg.mkPen('r', width=2))
             self._pg_roi_item.sigRegionChanged.connect(self._pg_roi_changed)
             self._pg_view_box.addItem(self._pg_roi_item)
             self._pg_roi_changed(self._pg_roi_item)
@@ -4331,7 +4905,7 @@ class TomoGUI(QWidget):
     def auto_img_contrast(self, saturation=10):
         """Fiji-like Auto: trims tails within current window; uses ROI if present; never edits pixels."""
         if self._current_img is None:
-            self.log_output.append("\u26a0\ufe0f No image loaded to auto contrast.")
+            self.log_output.append("No image loaded to auto contrast.")
             return
 
         img = self._current_img
@@ -4344,7 +4918,7 @@ class TomoGUI(QWidget):
             y0 = max(0, min(h, int(np.floor(y0))))
             y1 = max(0, min(h, int(np.ceil(y1))))
             if x1 <= x0 or y1 <= y0:
-                self.log_output.append("\u26a0\ufe0f ROI too small.")
+                self.log_output.append("ROI too small.")
                 return
             data = img[y0:y1, x0:x1]
         else:
@@ -4353,7 +4927,7 @@ class TomoGUI(QWidget):
         a = np.asarray(data, dtype=float).ravel()
         a = a[np.isfinite(a)]
         if a.size == 0:
-            self.log_output.append("\u26a0\ufe0f No finite pixels for Auto.")
+            self.log_output.append("No finite pixels for Auto.")
             return
 
         vmin = self.vmin if self.vmin is not None else float(np.nanmin(a))
@@ -4386,7 +4960,7 @@ class TomoGUI(QWidget):
 
     def reset_img_contrast(self): #link to Reset button
         if self._current_img is None:
-            self.log_output.append("\u26a0\ufe0f No image loaded to reset contrast.")
+            self.log_output.append("No image loaded to reset contrast.")
             return
         else:
             self.vmin, self.vmax = round(self._current_img.min(), 5), round(self._current_img.max(), 5)
@@ -4423,38 +4997,70 @@ class TomoGUI(QWidget):
     def update_full_slice(self):
         idx = self.slice_slider.value()
         self._remember_view()
-        if 0 <= idx < len(self.full_files):
-            path = self.full_files[idx]
-            self.show_image(path, flag=None)
-            self.filename_label.setText(os.path.basename(path))
+        if not (0 <= idx < len(self.full_files)):
+            return
+        entry = self.full_files[idx]
+        if self.full_h5 is not None:
+            # H5 mode: entry is a slice index.
+            self.show_image(int(entry), flag="full_h5")
+            self.filename_label.setText(
+                f"{os.path.basename(self.full_h5_path)} [slice {entry}]"
+            )
+        else:
+            self.show_image(entry, flag=None)
+            self.filename_label.setText(os.path.basename(entry))
         
 
-    def _safe_open_image(self, path, flag=None, retries=3): 
-        #add flag to seperate raw, recon
+    def _safe_open_image(self, path, flag=None, retries=3):
+        # flag values: None → TIFF path, "raw" → projection index into raw H5,
+        # "full_h5" → slice index into the open full-recon H5.
+        # Returns the array on success, or None if every attempt failed
+        # (e.g. H5 volume being actively written by tomocupy, missing part
+        # files, corrupt header). Callers must handle None.
+        last_exc = None
         for _ in range(retries):
             try:
                 if flag == "raw":
-                    return self._raw_h5['/exchange/data'][path,:,:]
-                else:
-                    with Image.open(path) as im:
-                        return np.array(im)
-            except Exception:
+                    return self._raw_h5['/exchange/data'][path, :, :]
+                if flag == "full_h5":
+                    return self.full_h5['/exchange/data'][int(path), :, :]
+                with Image.open(path) as im:
+                    return np.array(im)
+            except (OSError, KeyError, ValueError) as exc:
+                last_exc = exc
                 QApplication.processEvents()
-        if flag == "raw":
-            return self._raw_h5['/exchange/data'][path,:,:]
-        else:
-            with Image.open(path) as im:
-                return np.array(im)
+        self.log_output.append(
+            f'<span style="color:orange;">Could not read image '
+            f'({flag or "tiff"}, {path!r}): {last_exc}. '
+            f'File may still be under reconstruction.</span>'
+        )
+        return None
 
     def show_image(self, img_path, flag=None):
-        #Flag arg to seperate prj and recon 
+        # flag: None → TIFF path; "raw" → raw projection index (dark/flat
+        # corrected inline); "full_h5" → slice index into self.full_h5.
         if flag == "raw":
-            img = self._raw_h5['/exchange/data'][img_path,:,:] #for raw projections, it takes img_path as idx
-            img = (img - self.dark)/(self.flat - self.dark)
+            try:
+                img = self._raw_h5['/exchange/data'][img_path, :, :]
+                img = (img - self.dark) / (self.flat - self.dark)
+            except (OSError, KeyError, ValueError) as exc:
+                self._blank_viewer()
+                self.log_output.append(
+                    f'<span style="color:orange;">Could not read raw '
+                    f'projection {img_path}: {exc}</span>'
+                )
+                return
+        elif flag == "full_h5":
+            img = self._safe_open_image(img_path, flag="full_h5")
         else:
             img = self._safe_open_image(img_path)
-            if img.ndim == 3:
+            if img is not None and img.ndim == 3:
                 img = img[..., 0]
+        if img is None:
+            # _safe_open_image already logged; just make sure the viewer
+            # isn't left showing a stale frame from another file.
+            self._blank_viewer()
+            return
         h, w = img.shape
         self._current_img = img
         self._current_img_path = img_path
@@ -4477,12 +5083,10 @@ class TomoGUI(QWidget):
             self._pg_image_item.setImage(img, autoLevels=False)
             self._pg_image_item.setLevels([vmin, vmax])
             try:
-                lut = (_mpl_cm.colormaps[self.current_cmap](np.linspace(0, 1, 256)) * 255).astype(np.uint8)
+                lut = (_mpl.colormaps[self.current_cmap](np.linspace(0, 1, 256)) * 255).astype(np.uint8)
                 self._pg_image_item.setLookupTable(lut[:, :3])
             except Exception:
                 pass
-            if self._last_image_shape != (h, w):
-                self._pg_view_box.autoRange()
             self._last_image_shape = (h, w)
             return
 
@@ -4528,6 +5132,8 @@ class TomoGUI(QWidget):
         self.vmax = None
         self.min_input.clear()
         self.max_input.clear()
+        if not VISPY_AVAILABLE and hasattr(self, '_pg_view_box'):
+            self._pg_view_box.enableAutoRange()
 
     # ===== TOMOLOG METHODS =====
     def get_note_value(self):
@@ -4558,12 +5164,12 @@ class TomoGUI(QWidget):
                 self.process[:] = [(pp, nn) for (pp, nn) in self.process if pp is not p]
             except Exception:
                 pass
-            self.log_output.append(f"\u2705[{name}] done." if code == 0
-                                else f"\u274c[{name}] failed with code {code}.")
+            self.log_output.append(f"[{name}] done." if code == 0
+                                else f"[{name}] failed with code {code}.")
 
         p.finished.connect(_done)
         p.errorOccurred.connect(
-            lambda _err: self.log_output.append(f"\u274c[{name}] {p.errorString()}")
+            lambda _err: self.log_output.append(f"[{name}] {p.errorString()}")
         )
 
         if not isinstance(self.process, list):
@@ -4585,8 +5191,8 @@ class TomoGUI(QWidget):
         vmax = self.max_input.text().strip()
 
         if not data_folder:
-            self.log_output.append(f'<span style="color:red;">\u274c[ERROR] Data folder not set</span>')
-            return
+          self.log_output.append(f'<span style="color:red;">[ERROR] Data folder not set</span>')
+          return
 
         flist = []
         if not scan_number:
@@ -4594,16 +5200,16 @@ class TomoGUI(QWidget):
             for file_info in self.batch_file_main_list:
                 if file_info['checkbox'].isChecked():
                     fp = (file_info.get('path')
-                          or file_info.get('file')
-                          or (os.path.join(data_folder, file_info['filename'])
-                              if file_info.get('filename') else None))
+                            or file_info.get('file')
+                            or (os.path.join(data_folder, file_info['filename'])
+                                if file_info.get('filename') else None))
                     if fp:
                         flist.append(fp)
             if not flist and self.highlight_scan:
                 flist.append(self.highlight_scan)
             if not flist:
-                self.log_output.append('<span style="color:red;">\u274c[ERROR] No files selected in table</span>')
-                return
+              self.log_output.append('<span style="color:red;">[ERROR] No files selected in table</span>')
+              return
         else:
             numbers = set()
             sns = scan_number.split(",")
@@ -4613,26 +5219,26 @@ class TomoGUI(QWidget):
                         start, end = map(int, sn.split("-"))
                         numbers.update(range(start, end+1))
                     except ValueError:
-                        self.log_output.append(f'<span style="color:red;">\u274c[ERROR] Invalid range: {sn}</span>')
+                      self.log_output.append(f'<span style="color:red;">[ERROR] Invalid range: {sn}</span>')
                 else:
                     try:
                         numbers.add(int(sn))
                     except ValueError:
-                        self.log_output.append(f'<span style="color:red;">\u274c[ERROR] Invalid scan number: {sn}</span>')
+                      self.log_output.append(f'<span style="color:red;">[ERROR] Invalid scan number: {sn}</span>')
             for n in numbers:
                 fn = os.path.join(data_folder, f"*{n:04d}.h5")
                 try:
                     filename = glob.glob(fn)[0]
                 except IndexError:
-                    self.log_output.append(f'<span style="color:red;">Scan {n:04d} not exist, stop</span>')
-                    break
+                  self.log_output.append(f'<span style="color:red;">Scan {n:04d} not exist, stop</span>')
+                  break
                 flist.append(filename)
         
         note_value = self.get_note_value()
         auto_contrast = (vmin == "" and vmax == "")
         if auto_contrast:
             self.log_output.append(
-                '<span style="color:#888;">ℹ️ min/max blank — per-file 5–95% '
+              '<span style="color:#888;">min/max blank — per-file 5–95% '
                 'percentile contrast will be computed from each reconstruction.</span>'
             )
         for input_fn in flist:
@@ -4652,12 +5258,12 @@ class TomoGUI(QWidget):
                 if avmin is not None and avmax is not None:
                     cmd.extend(["--min", avmin, "--max", avmax])
                     self.log_output.append(
-                        f'<span style="color:#888;">  auto contrast {os.path.basename(input_fn)}: '
+                      f'<span style="color:#888;"> auto contrast {os.path.basename(input_fn)}: '
                         f'min={avmin}, max={avmax}</span>'
                     )
                 else:
                     self.log_output.append(
-                        f'<span style="color:orange;">⚠️ no reconstruction TIFFs for '
+                      f'<span style="color:orange;">no reconstruction TIFFs for '
                         f'{os.path.basename(input_fn)} — tomolog will use its own default contrast.</span>'
                     )
             else:
@@ -4672,22 +5278,22 @@ class TomoGUI(QWidget):
             QApplication.processEvents()
             code = self.run_command_live(cmd, proj_file=input_fn, job_label="tomolog", wait=True, cuda_devices=None)
             if code == 0:
-                self.log_output.append(f'<span style="color:green;">\u2705 Done tomolog {input_fn}</span>')
+              self.log_output.append(f'<span style="color:green;">Done tomolog {input_fn}</span>')
             else:
-                self.log_output.append(f'<span style="color:red;">\u274c Tomolog {input_fn} failed</span>')
+              self.log_output.append(f'<span style="color:red;">Tomolog {input_fn} failed</span>')
 
     # ===== BATCH PROCESSING METHODS =====
     # def _run_reconstruction_on_machine(self, file_path, recon_type='try'):
-    #     """
+    #    """
     #     Run reconstruction on selected machine (local or remote)
 
     #     Args:
     #         file_path: Path to the .h5 file
-    #         recon_type: 'try' or 'full'
+    #        recon_type: 'try' or 'full'
 
     #     Returns:
     #         Exit code (0 for success)
-    #     """
+    #    """
     #     machine = self.batch_machine_box.currentText()
 
     #     # Get reconstruction parameters from Main tab
@@ -4697,62 +5303,62 @@ class TomoGUI(QWidget):
     #     filename = os.path.basename(file_path)
     #     cor_val = None
     #     for file_info in self.batch_file_list:
-    #         if file_info['filename'] == filename:
-    #             cor_val = file_info['cor_input'].text().strip()
+    #        if file_info['filename'] == filename:
+    #            cor_val = file_info['cor_input'].text().strip()
     #             break
 
     #     # Batch tab ALWAYS uses manual COR with the value from the batch table
     #     # Validate COR input - batch tab requires COR to be set in table
     #     if not cor_val:
-    #         self.log_output.append(f'<span style="color:red;">❌ No COR value in batch table for {filename}</span>')
+    #       self.log_output.append(f'<span style="color:red;">No COR value in batch table for {filename}</span>')
     #         return -1
 
     #     try:
     #         cor = float(cor_val)
-    #         self.log_output.append(f'📍 Using COR value from batch table: {cor_val} for {filename}')
+    #        self.log_output.append(f'Using COR value from batch table: {cor_val} for {filename}')
     #     except ValueError:
-    #         self.log_output.append(f'<span style="color:red;">❌ Invalid COR value "{cor_val}" for {filename}</span>')
+    #       self.log_output.append(f'<span style="color:red;">Invalid COR value "{cor_val}" for {filename}</span>')
     #         return -1
 
-    #     gpu = self.cuda_box_try.currentText().strip() if recon_type == 'try' else self.cuda_box_full.currentText().strip()
+    #    gpu = self.cuda_box_try.currentText().strip() if recon_type == 'try' else self.cuda_box_full.currentText().strip()
 
     #     # Build command
     #     # Batch tab ALWAYS uses manual COR with the value from the batch table
     #     if self.use_conf_box.isChecked():
-    #         config_editor = self.config_editor_try if recon_type == 'try' else self.config_editor_full
+    #        config_editor = self.config_editor_try if recon_type == 'try' else self.config_editor_full
     #         config_text = config_editor.toPlainText()
     #         if not config_text.strip():
-    #             self.log_output.append(f'<span style="color:red;">⚠️ No config text</span>')
+    #           self.log_output.append(f'<span style="color:red;">No config text</span>')
     #             return -1
 
-    #         temp_conf = os.path.join(self.data_path.text(), f"temp_{recon_type}.conf")
-    #         with open(temp_conf, "w") as f:
+    #        temp_conf = os.path.join(self.data_path.text(), f"temp_{recon_type}.conf")
+    #        with open(temp_conf, "w") as f:
     #             f.write(config_text)
 
-    #         cmd = ["tomocupy", str(recon_way),
-    #                "--reconstruction-type", recon_type,
-    #                "--config", temp_conf,
-    #                "--file-name", file_path,
-    #                "--rotation-axis-auto", "manual",
-    #                "--rotation-axis", str(cor)]
+    #        cmd = ["tomocupy", str(recon_way),
+    #               "--reconstruction-type", recon_type,
+    #               "--config", temp_conf,
+    #               "--file-name", file_path,
+    #               "--rotation-axis-auto", "manual",
+    #               "--rotation-axis", str(cor)]
     #     else:
-    #         cmd = ["tomocupy", str(recon_way),
-    #                "--reconstruction-type", recon_type,
-    #                "--file-name", file_path,
-    #                "--rotation-axis-auto", "manual",
-    #                "--rotation-axis", str(cor)]
+    #        cmd = ["tomocupy", str(recon_way),
+    #               "--reconstruction-type", recon_type,
+    #               "--file-name", file_path,
+    #               "--rotation-axis-auto", "manual",
+    #               "--rotation-axis", str(cor)]
 
     #     # Wrap command for remote execution if needed
     #     cmd = self._get_batch_machine_command(cmd, machine)
 
     #     # Log the machine being used
-    #     if machine != "Local":
-    #         self.log_output.append(f'🖥️ Running on {machine}: {os.path.basename(file_path)}')
+    #    if machine != "Local":
+    #        self.log_output.append(f'🖥️ Running on {machine}: {os.path.basename(file_path)}')
 
     #     # Execute command
     #     code = self.run_command_live(cmd, proj_file=file_path,
-    #                                  job_label=f"{recon_type}-{machine}",
-    #                                  wait=True, cuda_devices=gpu if machine == "Local" else None)
+    #                                 job_label=f"{recon_type}-{machine}",
+    #                                 wait=True, cuda_devices=gpu if machine == "Local" else None)
 
     #     return code
 
@@ -4795,12 +5401,12 @@ class TomoGUI(QWidget):
 
             n = end_row - start_row + 1
             self.log_output.append(
-                f'<span style="color:green;">✅ Selected rows {start_row}–{end_row} '
+              f'<span style="color:green;">Selected rows {start_row}–{end_row} '
                 f'({n} files)</span>'
             )
             if n_skipped_small:
                 self.log_output.append(
-                    f'<span style="color:#888;">   ({n_skipped_small} small-file '
+                  f'<span style="color:#888;"> ({n_skipped_small} small-file '
                     f'row(s) kept unchecked)</span>'
                 )
 
@@ -4815,10 +5421,9 @@ class TomoGUI(QWidget):
             filename = file_info['filename']
             proj_name = os.path.splitext(filename)[0]
             try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
-            full_dir = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
 
             has_try = os.path.isdir(try_dir) and len(glob.glob(os.path.join(try_dir, "*.tiff"))) > 0
-            has_full = os.path.isdir(full_dir) and len(glob.glob(os.path.join(full_dir, "*.tiff"))) > 0
+            has_full = self._resolve_full_recon(data_folder, proj_name)['kind'] is not None
 
             # Determine new color
             if has_full:
@@ -4843,34 +5448,34 @@ class TomoGUI(QWidget):
             pass
 
     # def _refresh_batch_file_list(self):
-    #     """Refresh the file list in the batch processing tab"""
+    #    """Refresh the file list in the batch processing tab"""
     #     folder = self.data_path.text()
     #     if not folder or not os.path.isdir(folder):
-    #         QMessageBox.warning(self, "Warning", "Please select a valid data folder first.")
+    #        QMessageBox.warning(self, "Warning", "Please select a valid data folder first.")
     #         return
 
     #     # Warn if queue is running
     #     if self.batch_running:
     #         reply = QMessageBox.question(
-    #             self, 'Queue Running',
-    #             f'A batch queue is currently running ({len(self.batch_running_jobs)} jobs active, {len(self.batch_job_queue)} queued).\n\n'
-    #             f'Refreshing will delete the table widgets but jobs will continue running in the background.\n\n'
-    #             f'Continue with refresh?',
+    #            self, 'Queue Running',
+    #            f'A batch queue is currently running ({len(self.batch_running_jobs)} jobs active, {len(self.batch_job_queue)} queued).\n\n'
+    #            f'Refreshing will delete the table widgets but jobs will continue running in the background.\n\n'
+    #            f'Continue with refresh?',
     #             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
     #         )
     #         if reply == QMessageBox.No:
     #             return
-    #         self.log_output.append(f'<span style="color:orange;">⚠️  Refreshed file list while queue was running - status updates may be lost</span>')
+    #       self.log_output.append(f'<span style="color:orange;"> Refreshed file list while queue was running - status updates may be lost</span>')
 
     #     # Get all .h5 files
-    #     h5_files = sorted(glob.glob(os.path.join(folder, "*.h5")), key=os.path.getmtime, reverse=True)
+    #    h5_files = sorted(glob.glob(os.path.join(folder, "*.h5")), key=os.path.getmtime, reverse=True)
 
     #     # Save current COR values before clearing (to preserve user input)
     #     cor_values = {}
     #     for file_info in self.batch_file_list:
     #         try:
-    #             filename = file_info['filename']
-    #             cor_val = file_info['cor_input'].text().strip()
+    #            filename = file_info['filename']
+    #            cor_val = file_info['cor_input'].text().strip()
     #             if cor_val:
     #                 cor_values[filename] = cor_val
     #         except (KeyError, RuntimeError):
@@ -4893,27 +5498,27 @@ class TomoGUI(QWidget):
 
     #         # Check reconstruction status
     #         proj_name = os.path.splitext(filename)[0]
-    #         try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
-    #         full_dir = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
+    #        try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
+    #        full_dir = os.path.join(f"{data_folder}_rec", f"{proj_name}_rec")
 
-    #         has_try = os.path.isdir(try_dir) and len(glob.glob(os.path.join(try_dir, "*.tiff"))) > 0
-    #         has_full = os.path.isdir(full_dir) and len(glob.glob(os.path.join(full_dir, "*.tiff"))) > 0
+    #        has_try = os.path.isdir(try_dir) and len(glob.glob(os.path.join(try_dir, "*.tiff"))) > 0
+    #        has_full = os.path.isdir(full_dir) and len(glob.glob(os.path.join(full_dir, "*.tiff"))) > 0
 
     #         # Determine row color based on reconstruction status
     #         if has_full:
-    #             row_color = "green"  # Full reconstruction exists
+    #            row_color = "green"  # Full reconstruction exists
     #         elif has_try:
-    #             row_color = "orange"  # Only try reconstruction exists
+    #            row_color = "orange"  # Only try reconstruction exists
     #         else:
-    #             row_color = "red"  # No reconstruction
+    #            row_color = "red"  # No reconstruction
 
     #         # Store file info
     #         file_info = {
-    #             'path': file_path,
-    #             'filename': filename,
-    #             'status': 'Ready',
-    #             'row': row,
-    #             'recon_status': row_color
+    #            'path': file_path,
+    #            'filename': filename,
+    #            'status': 'Ready',
+    #            'row': row,
+    #            'recon_status': row_color
     #         }
     #         self.batch_file_list.append(file_info)
 
@@ -4926,11 +5531,11 @@ class TomoGUI(QWidget):
     #         checkbox_layout.setAlignment(Qt.AlignCenter)
     #         checkbox_layout.setContentsMargins(0, 0, 0, 0)
     #         self.batch_file_table.setCellWidget(row, 0, checkbox_widget)
-    #         file_info['checkbox'] = checkbox
+    #        file_info['checkbox'] = checkbox
 
     #         # Filename - show full name and set tooltip with full path
     #         filename_item = QTableWidgetItem(filename)
-    #         filename_item.setToolTip(f"{filename}\n\nFull path:\n{file_path}")
+    #        filename_item.setToolTip(f"{filename}\n\nFull path:\n{file_path}")
     #         self.batch_file_table.setItem(row, 1, filename_item)
 
     #         # File size
@@ -4943,36 +5548,36 @@ class TomoGUI(QWidget):
     #             size_item.setData(Qt.UserRole, file_size)
     #             self.batch_file_table.setItem(row, 2, size_item)
     #         except Exception as e:
-    #             self.batch_file_table.setItem(row, 2, QTableWidgetItem("N/A"))
+    #            self.batch_file_table.setItem(row, 2, QTableWidgetItem("N/A"))
 
     #         # COR value (editable)
     #         cor_input = QLineEdit()
-    #         cor_input.setPlaceholderText("COR value")
+    #        cor_input.setPlaceholderText("COR value")
     #         cor_input.setAlignment(Qt.AlignCenter)
     #         cor_input.setFixedWidth(80)
     #         # Restore previous COR value if it exists
     #         if filename in cor_values:
     #             cor_input.setText(cor_values[filename])
     #         self.batch_file_table.setCellWidget(row, 3, cor_input)
-    #         file_info['cor_input'] = cor_input
+    #        file_info['cor_input'] = cor_input
 
     #         # Status
-    #         status_item = QTableWidgetItem('Ready')
+    #        status_item = QTableWidgetItem('Ready')
     #         self.batch_file_table.setItem(row, 4, status_item)
-    #         file_info['status_item'] = status_item
+    #        file_info['status_item'] = status_item
 
     #         # View Data button (original HDF5 data)
-    #         view_data_btn = QPushButton("View Data")
+    #        view_data_btn = QPushButton("View Data")
     #         view_data_btn.clicked.connect(lambda checked, fp=file_path: self._batch_view_data(fp))
     #         self.batch_file_table.setCellWidget(row, 5, view_data_btn)
 
     #         # View Try button
-    #         view_try_btn = QPushButton("View Try")
+    #        view_try_btn = QPushButton("View Try")
     #         view_try_btn.clicked.connect(lambda checked, fp=file_path: self._batch_view_try(fp))
     #         self.batch_file_table.setCellWidget(row, 6, view_try_btn)
 
     #         # View Full button
-    #         view_full_btn = QPushButton("View Full")
+    #        view_full_btn = QPushButton("View Full")
     #         view_full_btn.clicked.connect(lambda checked, fp=file_path: self._batch_view_full(fp))
     #         self.batch_file_table.setCellWidget(row, 7, view_full_btn)
 
@@ -4982,12 +5587,12 @@ class TomoGUI(QWidget):
     #         actions_layout.setContentsMargins(2, 2, 2, 2)
     #         actions_layout.setSpacing(2)
 
-    #         try_btn = QPushButton("Try")
+    #        try_btn = QPushButton("Try")
     #         try_btn.setFixedWidth(50)
     #         try_btn.clicked.connect(lambda checked, fp=file_path: self._batch_run_try_single(fp))
     #         actions_layout.addWidget(try_btn)
 
-    #         full_btn = QPushButton("Full")
+    #        full_btn = QPushButton("Full")
     #         full_btn.setFixedWidth(50)
     #         full_btn.clicked.connect(lambda checked, fp=file_path: self._batch_run_full_single(fp))
     #         actions_layout.addWidget(full_btn)
@@ -4996,34 +5601,34 @@ class TomoGUI(QWidget):
 
     #         # Apply colored left border indicator based on reconstruction status
     #         # Create a colored indicator in the checkbox column
-    #         checkbox_widget.setStyleSheet(f"QWidget {{ border-left: 6px solid {row_color}; }}")
+    #        checkbox_widget.setStyleSheet(f"QWidget {{ border-left: 6px solid {row_color}; }}")
 
     #     # Re-enable sorting after populating the table
     #     self.batch_file_table.setSortingEnabled(True)
 
-    #     self.batch_status_label.setText(f"Loaded {len(h5_files)} files")
+    #    self.batch_status_label.setText(f"Loaded {len(h5_files)} files")
 
     #     # Try to auto-load COR values from CSV if no values were preserved from previous refresh
-    #     # Only auto-load if we don't already have COR values
+    #    # Only auto-load if we don't already have COR values
     #     if not cor_values:
     #         self._batch_load_cor_csv(silent=True)
     #     else:
     #         # Count how many COR values were restored
     #         restored_count = len(cor_values)
-    #         self.batch_status_label.setText(f"Loaded {len(h5_files)} files ({restored_count} with COR values)")
+    #        self.batch_status_label.setText(f"Loaded {len(h5_files)} files ({restored_count} with COR values)")
 
     # def _batch_save_cor_csv(self):
-    #     """Save COR values to CSV file in the data directory"""
+    #    """Save COR values to CSV file in the data directory"""
     #     folder = self.data_path.text()
     #     if not folder or not os.path.isdir(folder):
-    #         QMessageBox.warning(self, "Warning", "Please select a valid data folder first.")
+    #        QMessageBox.warning(self, "Warning", "Please select a valid data folder first.")
     #         return
 
     #     if not self.batch_file_list:
-    #         QMessageBox.warning(self, "Warning", "No files in the batch list.")
+    #        QMessageBox.warning(self, "Warning", "No files in the batch list.")
     #         return
 
-    #     csv_path = os.path.join(folder, "batch_cor_values.csv")
+    #    csv_path = os.path.join(folder, "batch_cor_values.csv")
 
     #     try:
     #         import csv
@@ -5032,12 +5637,12 @@ class TomoGUI(QWidget):
 
     #         with open(csv_path, 'w', newline='') as csvfile:
     #             writer = csv.writer(csvfile)
-    #             writer.writerow(['Filename', 'COR'])
+    #            writer.writerow(['Filename', 'COR'])
 
     #             for file_info in self.batch_file_list:
     #                 try:
-    #                     filename = file_info['filename']
-    #                     cor_value = file_info['cor_input'].text().strip()
+    #                    filename = file_info['filename']
+    #                    cor_value = file_info['cor_input'].text().strip()
     #                     writer.writerow([filename, cor_value])
     #                     saved_count += 1
     #                 except (RuntimeError, KeyError):
@@ -5046,46 +5651,46 @@ class TomoGUI(QWidget):
     #                     continue
 
     #         if skipped_count > 0:
-    #             self.log_output.append(f'<span style="color:orange;">⚠️  Saved {saved_count} COR values to {csv_path} ({skipped_count} skipped - widgets deleted)</span>')
-    #             self.batch_status_label.setText(f"COR values saved ({skipped_count} files skipped)")
-    #             QMessageBox.information(self, "Success", f"COR values saved to:\n{csv_path}\n\n{saved_count} saved, {skipped_count} skipped (deleted files)")
+    #           self.log_output.append(f'<span style="color:orange;"> Saved {saved_count} COR values to {csv_path} ({skipped_count} skipped - widgets deleted)</span>')
+    #            self.batch_status_label.setText(f"COR values saved ({skipped_count} files skipped)")
+    #            QMessageBox.information(self, "Success", f"COR values saved to:\n{csv_path}\n\n{saved_count} saved, {skipped_count} skipped (deleted files)")
     #         else:
-    #             self.log_output.append(f'<span style="color:green;">✅ Saved {saved_count} COR values to {csv_path}</span>')
-    #             self.batch_status_label.setText(f"COR values saved to batch_cor_values.csv")
-    #             QMessageBox.information(self, "Success", f"COR values saved to:\n{csv_path}")
+    #           self.log_output.append(f'<span style="color:green;">Saved {saved_count} COR values to {csv_path}</span>')
+    #            self.batch_status_label.setText(f"COR values saved to batch_cor_values.csv")
+    #            QMessageBox.information(self, "Success", f"COR values saved to:\n{csv_path}")
 
     #     except Exception as e:
-    #         self.log_output.append(f'<span style="color:red;">❌ Failed to save COR CSV: {e}</span>')
-    #         QMessageBox.critical(self, "Error", f"Failed to save COR values:\n{e}")
+    #       self.log_output.append(f'<span style="color:red;">Failed to save COR CSV: {e}</span>')
+    #        QMessageBox.critical(self, "Error", f"Failed to save COR values:\n{e}")
 
     # def _batch_load_cor_csv(self, silent=False):
-    #     """Load COR values from CSV file in the data directory"""
+    #    """Load COR values from CSV file in the data directory"""
     #     folder = self.data_path.text()
     #     if not folder or not os.path.isdir(folder):
     #         if not silent:
-    #             QMessageBox.warning(self, "Warning", "Please select a valid data folder first.")
+    #            QMessageBox.warning(self, "Warning", "Please select a valid data folder first.")
     #         return
 
     #     if not self.batch_file_list:
     #         if not silent:
-    #             QMessageBox.warning(self, "Warning", "No files in the batch list. Refresh the file list first.")
+    #            QMessageBox.warning(self, "Warning", "No files in the batch list. Refresh the file list first.")
     #         return
 
-    #     csv_path = os.path.join(folder, "batch_cor_values.csv")
+    #    csv_path = os.path.join(folder, "batch_cor_values.csv")
 
     #     if not os.path.exists(csv_path):
     #         if not silent:
-    #             QMessageBox.warning(self, "Warning", f"COR CSV file not found:\n{csv_path}")
+    #            QMessageBox.warning(self, "Warning", f"COR CSV file not found:\n{csv_path}")
     #         return
 
     #     try:
     #         import csv
     #         cor_dict = {}
-    #         with open(csv_path, 'r') as csvfile:
+    #        with open(csv_path, 'r') as csvfile:
     #             reader = csv.DictReader(csvfile)
     #             for row in reader:
-    #                 filename = row.get('Filename', '').strip()
-    #                 cor_value = row.get('COR', '').strip()
+    #                filename = row.get('Filename', '').strip()
+    #                cor_value = row.get('COR', '').strip()
     #                 if filename:
     #                     cor_dict[filename] = cor_value
 
@@ -5094,9 +5699,9 @@ class TomoGUI(QWidget):
     #         skipped_count = 0
     #         for file_info in self.batch_file_list:
     #             try:
-    #                 filename = file_info['filename']
+    #                filename = file_info['filename']
     #                 if filename in cor_dict:
-    #                     file_info['cor_input'].setText(cor_dict[filename])
+    #                    file_info['cor_input'].setText(cor_dict[filename])
     #                     loaded_count += 1
     #             except (RuntimeError, KeyError):
     #                 # Widget was deleted (e.g., file was removed)
@@ -5105,34 +5710,34 @@ class TomoGUI(QWidget):
 
     #         if not silent:
     #             if skipped_count > 0:
-    #                 self.log_output.append(f'<span style="color:orange;">⚠️  Loaded {loaded_count} COR values from {csv_path} ({skipped_count} skipped - widgets deleted)</span>')
-    #                 self.batch_status_label.setText(f"Loaded {loaded_count} COR values ({skipped_count} skipped)")
-    #                 QMessageBox.information(self, "Success", f"Loaded {loaded_count} COR values from:\n{csv_path}\n\n{skipped_count} files skipped (deleted widgets)")
+    #               self.log_output.append(f'<span style="color:orange;"> Loaded {loaded_count} COR values from {csv_path} ({skipped_count} skipped - widgets deleted)</span>')
+    #                self.batch_status_label.setText(f"Loaded {loaded_count} COR values ({skipped_count} skipped)")
+    #                QMessageBox.information(self, "Success", f"Loaded {loaded_count} COR values from:\n{csv_path}\n\n{skipped_count} files skipped (deleted widgets)")
     #             else:
-    #                 self.log_output.append(f'<span style="color:green;">✅ Loaded COR values from {csv_path}</span>')
-    #                 self.batch_status_label.setText(f"Loaded {loaded_count} COR values from CSV")
-    #                 QMessageBox.information(self, "Success", f"Loaded {loaded_count} COR values from:\n{csv_path}")
+    #               self.log_output.append(f'<span style="color:green;">Loaded COR values from {csv_path}</span>')
+    #                self.batch_status_label.setText(f"Loaded {loaded_count} COR values from CSV")
+    #                QMessageBox.information(self, "Success", f"Loaded {loaded_count} COR values from:\n{csv_path}")
     #         else:
-    #             self.batch_status_label.setText(f"Loaded {len(self.batch_file_list)} files ({loaded_count} with COR values)")
+    #            self.batch_status_label.setText(f"Loaded {len(self.batch_file_list)} files ({loaded_count} with COR values)")
 
     #     except Exception as e:
     #         if not silent:
-    #             self.log_output.append(f'<span style="color:red;">❌ Failed to load COR CSV: {e}</span>')
-    #             QMessageBox.critical(self, "Error", f"Failed to load COR values:\n{e}")
+    #           self.log_output.append(f'<span style="color:red;">Failed to load COR CSV: {e}</span>')
+    #            QMessageBox.critical(self, "Error", f"Failed to load COR values:\n{e}")
 
 
     # def _batch_remove_selected(self):
-    #     """Physically delete selected files from the filesystem"""
-    #     files_to_remove = [f for f in self.batch_file_list if f['checkbox'].isChecked()]
+    #    """Physically delete selected files from the filesystem"""
+    #    files_to_remove = [f for f in self.batch_file_list if f['checkbox'].isChecked()]
 
     #     if not files_to_remove:
-    #         QMessageBox.warning(self, "Warning", "No files selected.")
+    #        QMessageBox.warning(self, "Warning", "No files selected.")
     #         return
 
     #     # Confirm deletion
     #     reply = QMessageBox.question(
-    #         self, 'Confirm File Deletion',
-    #         f'Are you sure you want to PERMANENTLY DELETE {len(files_to_remove)} file(s) from disk?\n\nThis action cannot be undone!',
+    #        self, 'Confirm File Deletion',
+    #        f'Are you sure you want to PERMANENTLY DELETE {len(files_to_remove)} file(s) from disk?\n\nThis action cannot be undone!',
     #         QMessageBox.Yes | QMessageBox.No, QMessageBox.No
     #     )
 
@@ -5146,46 +5751,46 @@ class TomoGUI(QWidget):
 
     #     for file_info in files_to_remove:
     #         try:
-    #             os.remove(file_info['path'])
-    #             rows_to_remove.append(file_info['row'])
+    #            os.remove(file_info['path'])
+    #            rows_to_remove.append(file_info['row'])
     #             deleted_count += 1
-    #             self.log_output.append(f'<span style="color:green;">✅ Deleted: {file_info["filename"]}</span>')
+    #           self.log_output.append(f'<span style="color:green;">Deleted: {file_info["filename"]}</span>')
     #         except Exception as e:
-    #             failed_files.append(file_info['filename'])
-    #             self.log_output.append(f'<span style="color:red;">❌ Failed to delete {file_info["filename"]}: {e}</span>')
+    #            failed_files.append(file_info['filename'])
+    #           self.log_output.append(f'<span style="color:red;">Failed to delete {file_info["filename"]}: {e}</span>')
 
     #     # Remove rows from table
     #     for row in sorted(rows_to_remove, reverse=True):
     #         self.batch_file_table.removeRow(row)
 
     #     # Update file list and row indices
-    #     self.batch_file_list = [f for f in self.batch_file_list if f['row'] not in rows_to_remove]
+    #    self.batch_file_list = [f for f in self.batch_file_list if f['row'] not in rows_to_remove]
     #     for i, file_info in enumerate(self.batch_file_list):
-    #         file_info['row'] = i
+    #        file_info['row'] = i
 
     #     # Update status
     #     if failed_files:
-    #         self.batch_status_label.setText(f"Deleted {deleted_count} files, {len(failed_files)} failed")
+    #        self.batch_status_label.setText(f"Deleted {deleted_count} files, {len(failed_files)} failed")
     #     else:
-    #         self.batch_status_label.setText(f"Successfully deleted {deleted_count} files")
+    #        self.batch_status_label.setText(f"Successfully deleted {deleted_count} files")
 
     #     # Refresh the main file dropdown
     #     self.refresh_h5_files()
 
     def _batch_view_data(self, file_path):
-         """Open HDF5 viewer to view original data"""
-         if not os.path.exists(file_path):
-             QMessageBox.warning(self, "File Not Found", f"File does not exist:\n{file_path}")
-             return
+        """Open HDF5 viewer to view original data"""
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "File Not Found", f"File does not exist:\n{file_path}")
+            return
 
-         try:
-             # Create and show the HDF5 viewer dialog
-             viewer = HDF5ImageDividerDialog(file_path=file_path, parent=self)
-             viewer.show()
-             self.log_output.append(f'<span style="color:green;">✅ Opened HDF5 viewer for: {os.path.basename(file_path)}</span>')
-         except Exception as e:
-             QMessageBox.critical(self, "Error", f"Failed to open HDF5 viewer:\n{str(e)}")
-             self.log_output.append(f'<span style="color:red;">❌ Failed to open HDF5 viewer: {str(e)}</span>')
+        try:
+            # Create and show the HDF5 viewer dialog
+            viewer = HDF5ImageDividerDialog(file_path=file_path, parent=self)
+            viewer.show()
+            self.log_output.append(f'<span style="color:green;">Opened HDF5 viewer for: {os.path.basename(file_path)}</span>')
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open HDF5 viewer:\n{str(e)}")
+            self.log_output.append(f'<span style="color:red;">Failed to open HDF5 viewer: {str(e)}</span>')
 
     def _batch_view_selected_data(self):
         """Open HDF5 viewer for the first selected file"""
@@ -5196,7 +5801,7 @@ class TomoGUI(QWidget):
 
         if not selected_files:
             QMessageBox.warning(self, "No Selection", "Please select at least one file to view.")
-            self.log_output.append('<span style="color:orange;">⚠️  No files selected for viewing</span>')
+            self.log_output.append('<span style="color:orange;"> No files selected for viewing</span>')
             return
 
         # Open viewer for the first selected file
@@ -5204,7 +5809,7 @@ class TomoGUI(QWidget):
         self._batch_view_data(first_file)
 
         if len(selected_files) > 1:
-            self.log_output.append(f'<span style="color:blue;">ℹ️  {len(selected_files)} files selected, opened first: {os.path.basename(first_file)}</span>')
+            self.log_output.append(f'<span style="color:blue;"> {len(selected_files)} files selected, opened first: {os.path.basename(first_file)}</span>')
 
     def _delete_selected_files(self):
         """Delete selected HDF5 files from disk after user confirmation."""
@@ -5214,7 +5819,7 @@ class TomoGUI(QWidget):
                 selected.append(file_info['path'])
 
         if not selected:
-            self.log_output.append('<span style="color:orange;">⚠️ No files selected for deletion</span>')
+            self.log_output.append('<span style="color:orange;">No files selected for deletion</span>')
             return
 
         file_list = "\n".join(os.path.basename(f) for f in selected)
@@ -5232,13 +5837,13 @@ class TomoGUI(QWidget):
             try:
                 os.remove(f)
                 deleted += 1
-                self.log_output.append(f'🗑️ Deleted {os.path.basename(f)}')
+                self.log_output.append(f'️ Deleted {os.path.basename(f)}')
             except OSError as e:
-                self.log_output.append(f'<span style="color:red;">❌ Cannot delete {os.path.basename(f)}: {e}</span>')
+              self.log_output.append(f'<span style="color:red;">Cannot delete {os.path.basename(f)}: {e}</span>')
 
         if deleted:
-            self.log_output.append(f'<span style="color:green;">✅ Deleted {deleted}/{len(selected)} files. Refreshing table...</span>')
-            self.refresh_main_table()
+          self.log_output.append(f'<span style="color:green;">Deleted {deleted}/{len(selected)} files. Refreshing table...</span>')
+          self.refresh_main_table()
 
     def _select_done_try(self):
         found = False
@@ -5253,7 +5858,7 @@ class TomoGUI(QWidget):
             self.log_output.append(f"Select all files done try")
 
     # def _batch_view_try(self, file_path):
-    #     """View try reconstruction for a specific file"""
+    #    """View try reconstruction for a specific file"""
     #     # Set the file in the main dropdown
     #     index = self.proj_file_box.findData(file_path)
     #     if index >= 0:
@@ -5269,7 +5874,7 @@ class TomoGUI(QWidget):
     #     self.view_try_reconstruction()
 
     # def _batch_view_full(self, file_path):
-    #     """View full reconstruction for a specific file"""
+    #    """View full reconstruction for a specific file"""
     #     # Set the file in the main dropdown
     #     index = self.proj_file_box.findData(file_path)
     #     if index >= 0:
@@ -5294,15 +5899,15 @@ class TomoGUI(QWidget):
                 break
 
         if not file_info:
-            self.log_output.append(f'<span style="color:red;">❌ File not found in batch list</span>')
-            return
+          self.log_output.append(f'<span style="color:red;">File not found in batch list</span>')
+          return
 
         # Get COR value from batch table
         batch_cor = file_info['cor_input'].text().strip()
         if not batch_cor:
-            self.log_output.append(f'<span style="color:red;">❌ No COR value in batch table for {os.path.basename(file_path)}</span>')
-            QMessageBox.warning(self, "Missing COR", f"Please enter a COR value in the batch table for:\n{os.path.basename(file_path)}")
-            return
+          self.log_output.append(f'<span style="color:red;">No COR value in batch table for {os.path.basename(file_path)}</span>')
+          QMessageBox.warning(self, "Missing COR", f"Please enter a COR value in the batch table for:\n{os.path.basename(file_path)}")
+          return
 
         # Use the queue system with 1 GPU (respects the GPU settings)
         machine = self.batch_machine_box.currentText()
@@ -5321,15 +5926,15 @@ class TomoGUI(QWidget):
                 break
 
         if not file_info:
-            self.log_output.append(f'<span style="color:red;">❌ File not found in batch list</span>')
-            return
+          self.log_output.append(f'<span style="color:red;">File not found in batch list</span>')
+          return
 
         # Get COR value from batch table
         batch_cor = file_info['cor_input'].text().strip()
         if not batch_cor:
-            self.log_output.append(f'<span style="color:red;">❌ No COR value in batch table for {os.path.basename(file_path)}</span>')
-            QMessageBox.warning(self, "Missing COR", f"Please enter a COR value in the batch table for:\n{os.path.basename(file_path)}")
-            return
+          self.log_output.append(f'<span style="color:red;">No COR value in batch table for {os.path.basename(file_path)}</span>')
+          QMessageBox.warning(self, "Missing COR", f"Please enter a COR value in the batch table for:\n{os.path.basename(file_path)}")
+          return
 
         # Use the queue system with configured GPUs (respects the GPU settings)
         machine = self.batch_machine_box.currentText()
@@ -5341,7 +5946,7 @@ class TomoGUI(QWidget):
     def _batch_run_try_selected(self):
         """Run try reconstruction on all selected files with GPU queue management"""
         selected_files = [f for f in self.batch_file_main_list
-                          if f['checkbox'].isChecked() and not f.get('skipped_small')]
+                            if f['checkbox'].isChecked() and not f.get('skipped_small')]
         self._persist_params_for_files([f.get('path') for f in selected_files])
         machine = self.batch_machine_box.currentText()
 
@@ -5393,7 +5998,7 @@ class TomoGUI(QWidget):
                     row_found = r
                     break
             w = (self.batch_file_main_table.cellWidget(row_found, 2)
-                 if row_found >= 0 else None)
+                    if row_found >= 0 else None)
             w = w or fi.get('cor_input')
             if w is None:
                 continue
@@ -5412,7 +6017,7 @@ class TomoGUI(QWidget):
         if data_folder:
             self._save_cor_data(data_folder, self.cor_data)
         self.log_output.append(
-            f'<span style="color:#b26a00;">🧽 Cleared COR on {cleared} '
+          f'<span style="color:#b26a00;">🧽 Cleared COR on {cleared} '
             f'selected row(s) and persisted to rot_cen.json.</span>'
         )
 
@@ -5425,12 +6030,8 @@ class TomoGUI(QWidget):
         where verticalImageSize is the number of rows in /exchange/data.
         """
         import math
-        import glob
-        import re as _re
         import shutil
-        from argparse import Namespace
         import numpy as np
-        from PIL import Image
         import h5py
 
         proj_file = self.highlight_scan
@@ -5464,7 +6065,7 @@ class TomoGUI(QWidget):
         for fi in self.batch_file_main_list:
             if fi.get('path') == proj_file:
                 seed = (fi['cor_input'].text().strip()
-                        if fi.get('cor_input') else "")
+                      if fi.get('cor_input') else "")
                 break
         seed = seed or self.cor_input.text().strip()
         try:
@@ -5476,18 +6077,20 @@ class TomoGUI(QWidget):
             return
 
         self.log_output.append(
-            f'<span style="color:#00796b;">🎥 CamRot on '
+          f'<span style="color:#00796b;">CamRot on '
             f'{os.path.basename(proj_file)} — image height = '
             f'{vertical} px, seed COR = {seed}</span>'
         )
         QApplication.processEvents()
 
-        # Build base tomocupy-try cmd; we'll swap --nsino per call.
+        # Build base tomocupy-try+AI cmd; we'll swap --nsino per call.
+        # Use tomocupy's built-in AI center finder so this is one subprocess
+        # per nsino instead of "run try, then run inference on the TIFFs".
         base_cmd = [
             "tomocupy", self.recon_way_box.currentText(),
             "--reconstruction-type", "try",
             "--file-name", proj_file,
-            "--rotation-axis-auto", "manual",
+            "--rotation-axis-auto", "auto",
             "--rotation-axis", str(seed),
         ]
         base_cmd += self._gather_params_args()
@@ -5497,6 +6100,9 @@ class TomoGUI(QWidget):
         base_cmd += self._gather_Geometry_args()
         base_cmd += self._gather_Data_args()
         base_cmd += self._gather_Performance_args()
+        # AI-COR flags win argparse's last-wins tie-break against any
+        # --rotation-axis-method emitted by the Reconstruction tab.
+        base_cmd = self._apply_ai_cor(base_cmd)
 
         def _strip_nsino(cmd):
             out = []
@@ -5511,15 +6117,13 @@ class TomoGUI(QWidget):
                 out.append(a)
             return out
 
-        _CENTER_RE = _re.compile(r'center(\d+\.\d+)')
-
         def _try_and_infer(nsino):
             # Clean slate for this nsino
             if os.path.isdir(try_dir):
                 shutil.rmtree(try_dir, ignore_errors=True)
             cmd = _strip_nsino(base_cmd) + ["--nsino", str(nsino)]
             self.log_output.append(
-                f'<span style="color:#00796b;">   → Try at nsino={nsino} …</span>'
+                f'<span style="color:#00796b;"> → Try + AI COR at nsino={nsino} …</span>'
             )
             QApplication.processEvents()
             code = self.run_command_live(
@@ -5528,55 +6132,21 @@ class TomoGUI(QWidget):
                 wait=True, cuda_devices=None
             )
             if code != 0:
-                raise RuntimeError(f"tomocupy try at nsino={nsino} failed (exit {code})")
+                raise RuntimeError(f"tomocupy try+AI at nsino={nsino} failed (exit {code})")
 
-            tiffs = sorted(glob.glob(os.path.join(try_dir, "*.tiff")))
-            imgs, cors = [], []
-            for t in tiffs:
-                m = _CENTER_RE.search(os.path.basename(t))
-                if not m:
-                    continue
-                cors.append(float(m.group(1)))
-                imgs.append(np.array(Image.open(t)).astype(np.float32))
-            if not imgs:
+            ai_cor = self._read_ai_cor_from_try_dir(proj_file)
+            if ai_cor is None:
                 raise RuntimeError(
-                    f"no parsable TIFFs produced at nsino={nsino}")
-
-            # Remove any stale center_of_rotation.txt so we only read the
-            # result of THIS inference call.
-            cor_txt = os.path.join(try_dir, "center_of_rotation.txt")
-            if os.path.exists(cor_txt):
-                os.remove(cor_txt)
-
-            from tomogui._tomocor_infer.inference import inference_pipeline
-            args = Namespace(
-                infer_use_8bits=True,
-                infer_downsample_factor=2,
-                infer_num_windows=3,
-                infer_seed_number=10,
-                infer_model_path=model_path,
-                infer_window_size=518,
-            )
-            self.log_output.append(
-                f'<span style="color:#00796b;">   → AI infer at nsino={nsino} …</span>'
-            )
-            QApplication.processEvents()
-            inference_pipeline(args, np.array(imgs), np.array(cors), try_dir)
-            if not os.path.exists(cor_txt):
-                raise RuntimeError(
-                    f"inference at nsino={nsino} produced no center_of_rotation.txt")
-            with open(cor_txt) as fh:
-                lines = [ln.strip() for ln in fh if ln.strip()]
-            if not lines:
-                raise RuntimeError(f"empty center_of_rotation.txt at nsino={nsino}")
-            return float(lines[-1].split()[-1])
+                    f"tomocupy at nsino={nsino} did not produce "
+                    f"center_of_rotation.txt")
+            return ai_cor
 
         try:
             cor1 = _try_and_infer(0.1)
             cor2 = _try_and_infer(0.9)
         except Exception as e:
             self.log_output.append(
-                f'<span style="color:red;">❌ CamRot failed: {e}</span>'
+                f'<span style="color:red;">CamRot failed: {e}</span>'
             )
             return
 
@@ -5591,11 +6161,11 @@ class TomoGUI(QWidget):
             f"Estimated camera rotation: {angle_deg:.6f}°"
         )
         self.log_output.append(
-            f'<span style="color:#00796b;">🎥 CamRot result: COR(top)={cor1:.2f}, '
+          f'<span style="color:#00796b;">CamRot result: COR(top)={cor1:.2f}, '
             f'COR(bottom)={cor2:.2f}</span>'
         )
         self.log_output.append(
-            f'<span style="color:#00796b;font-weight:bold;">📐 Estimated camera '
+          f'<span style="color:#00796b;font-weight:bold;">Estimated camera '
             f'rotation: {angle_deg:.6f}°</span>'
         )
         QMessageBox.information(self, "CamRot", msg_short)
@@ -5659,7 +6229,7 @@ class TomoGUI(QWidget):
             selected.append([file_info, cor])
         if not selected:
             self.log_output.append(
-                '<span style="color:orange;">⚠️ No files selected.</span>'
+              '<span style="color:orange;">No files selected.</span>'
             )
             return
 
@@ -5765,7 +6335,7 @@ class TomoGUI(QWidget):
         table_series_cors = {}
         for fi_all in self.batch_file_main_list:
             txt_all = (fi_all['cor_input'].text().strip()
-                       if fi_all.get('cor_input') else "")
+                        if fi_all.get('cor_input') else "")
             try:
                 v = float(txt_all)
             except (ValueError, TypeError):
@@ -5773,18 +6343,18 @@ class TomoGUI(QWidget):
             key_all = _series_key(fi_all['filename'])[0]
             table_series_cors.setdefault(key_all, []).append(v)
 
-        # Drop any skipped-entry whose reason was "no COR" — it'll be replaced
+      # Drop any skipped-entry whose reason was "no COR" — it'll be replaced
         # by a fresh verdict from this pass (either filled or truly no donor).
         _missing_reasons = ("series has <2 numeric CORs",
                             "only left neighbour known",
                             "only right neighbour known",
                             "neighbours")  # prefix-match for 'neighbours ... differ'
         skipped = [s for s in skipped
-                   if not any(s[2].startswith(pfx) for pfx in _missing_reasons)]
+                    if not any(s[2].startswith(pfx) for pfx in _missing_reasons)]
 
         for file_info, _ in selected:
             current_txt = (file_info['cor_input'].text().strip()
-                           if file_info.get('cor_input') else "")
+                            if file_info.get('cor_input') else "")
             if current_txt:
                 continue   # already has a COR (original or freshly filled)
             series = _series_key(file_info['filename'])[0]
@@ -5798,12 +6368,12 @@ class TomoGUI(QWidget):
             filled_from_series.append((file_info, series, mean_val, len(donors)))
             changes.append(
                 (file_info, "", mean_val, series,
-                 f"series-mean of {len(donors)} donor(s)")
+                f"series-mean of {len(donors)} donor(s)")
             )
 
         if not changes and not skipped:
             self.log_output.append(
-                '<span style="color:green;">✅ No COR outliers detected and '
+              '<span style="color:green;">No COR outliers detected and '
                 'no missing CORs to fill.</span>'
             )
             return
@@ -5811,7 +6381,7 @@ class TomoGUI(QWidget):
         # 4) Persist to rot_cen.json
         data_folder = self.data_path.text().strip()
         for fi, _, newv, _, _ in changes:
-            self.cor_data[fi['path']] = f"{newv:.2f}"
+          self.cor_data[fi['path']] = f"{newv:.2f}"
         if data_folder:
             self._save_cor_data(data_folder, self.cor_data)
 
@@ -5819,19 +6389,19 @@ class TomoGUI(QWidget):
         n_fill = len(filled_from_series)
         n_outlier = len(changes) - n_fill
         self.log_output.append(
-            f'<span style="color:#8e44ad;">🧹 Fix COR Outliers (max Δ = {max_thresh:g} px): '
+          f'<span style="color:#8e44ad;">Fix COR Outliers (max Δ = {max_thresh:g} px): '
             f'{n_outlier} outlier(s) replaced, {n_fill} missing filled from '
             f'series mean, {len(skipped)} left unchanged across '
             f'{len(series_groups)} series.</span>'
         )
         for fi, old, newv, series, reason in changes:
             self.log_output.append(
-                f'   <b>{fi["filename"]}</b> <span style="color:#888;">[{series}]</span>'
-                f' : {old or "(empty)"} → {newv:.2f}   [{reason}]'
+                f'  <b>{fi["filename"]}</b> <span style="color:#888;">[{series}]</span>'
+              f' : {old or "(empty)"} → {newv:.2f}   [{reason}]'
             )
         for fi, series, reason in skipped:
             self.log_output.append(
-                f'<span style="color:#888;">   <b>{fi["filename"]}</b> [{series}] '
+              f'<span style="color:#888;"> <b>{fi["filename"]}</b> [{series}] '
                 f'skipped — {reason}</span>'
             )
 
@@ -5839,7 +6409,7 @@ class TomoGUI(QWidget):
         """Run AI Reco (Try → inference → Full) sequentially on all selected files.
         Unlike Try/Full batch, this one does NOT parallelise on GPUs — each file
         goes through the full AI pipeline one after the other so the torch
-        inference step doesn't fight the GPU with concurrent tomocupy jobs."""
+      inference step doesn't fight the GPU with concurrent tomocupy jobs."""
         selected_files = [f for f in self.batch_file_main_list if f['checkbox'].isChecked()]
         self._persist_params_for_files([f.get('path') for f in selected_files])
         # Drop auto-skipped small files even if they somehow ended up checked
@@ -5849,7 +6419,7 @@ class TomoGUI(QWidget):
         if dropped_small:
             selected_files = [f for f in selected_files if not f.get('skipped_small')]
             self.log_output.append(
-                f'<span style="color:#888;">🗑 ignoring {len(dropped_small)} '
+              f'<span style="color:#888;">ignoring {len(dropped_small)} '
                 f'small-file row(s) flagged as aborted scans.</span>'
             )
             for fi in dropped_small:
@@ -5863,8 +6433,8 @@ class TomoGUI(QWidget):
 
         model_path = self.ai_model_path.text().strip()
         if not model_path or not os.path.exists(model_path):
-            self.log_output.append('<span style="color:red;">❌ Invalid AI model path</span>')
-            return
+          self.log_output.append('<span style="color:red;">Invalid AI model path</span>')
+          return
 
         # AI Reco seed policy (per file): row COR if set, else top-bar COR.
         # Validate up front that every selected file will have SOMETHING to
@@ -5906,7 +6476,7 @@ class TomoGUI(QWidget):
         for fi_all in self.batch_file_main_list:
             try:
                 v = float((fi_all['cor_input'].text().strip()
-                           if fi_all.get('cor_input') else ""))
+                            if fi_all.get('cor_input') else ""))
             except (ValueError, TypeError):
                 continue
             _series_cors.setdefault(_sk(fi_all['filename']), []).append(v)
@@ -5915,7 +6485,7 @@ class TomoGUI(QWidget):
         missing_seed = []
         for fi in selected_files:
             cur = (fi['cor_input'].text().strip()
-                   if fi.get('cor_input') else "")
+                    if fi.get('cor_input') else "")
             try:
                 float(cur)
                 continue  # already has a COR — nothing to do
@@ -5927,17 +6497,14 @@ class TomoGUI(QWidget):
             elif not top_bar_ok and self.cor_method_box.currentText() != "auto":
                 missing_seed.append(fi['filename'])
 
-        if run_try and missing_seed:
+        # No hard failure on missing_seed anymore — files without row / top-bar
+        # / series donor will be seeded with image_width / 2 further down.
+        if missing_seed:
             self.log_output.append(
-                '<span style="color:red;">❌ AI Reco Try needs a starting COR for '
-                'every selected file. The following have no row COR, no series-mean '
-                'donor, and no valid top-bar fallback:</span>'
+              f'<span style="color:#888;">{len(missing_seed)} file(s) have '
+                f'no COR anywhere; they will be seeded with mid-width at '
+                f'dispatch time.</span>'
             )
-            for fn in missing_seed[:10]:
-                self.log_output.append(f'   {fn}')
-            if len(missing_seed) > 10:
-                self.log_output.append(f'   (+{len(missing_seed) - 10} more)')
-            return
 
         # Count how many will use the row COR vs the top-bar fallback
         row_cor_count = sum(1 for fi in selected_files
@@ -5947,7 +6514,7 @@ class TomoGUI(QWidget):
         seed_summary = (
             f"{row_cor_count} file(s) will use their table COR; "
             f"{len(selected_files) - row_cor_count} will fall back to the top-bar "
-            f"({top_bar_txt or 'auto'})."
+          f"({top_bar_txt or 'auto'})."
         )
         fill_summary = (
             f"\n{len(will_auto_fill)} file(s) will be auto-filled from series mean."
@@ -5974,67 +6541,87 @@ class TomoGUI(QWidget):
         if will_auto_fill:
             for fi, mean_val in will_auto_fill:
                 try:
-                    fi['cor_input'].setText(f"{mean_val:.2f}")
+                  fi['cor_input'].setText(f"{mean_val:.2f}")
                 except (RuntimeError, AttributeError):
                     pass
             self.log_output.append(
-                f'<span style="color:#8e44ad;">📍 Auto-filled {len(will_auto_fill)} '
+              f'<span style="color:#8e44ad;">Auto-filled {len(will_auto_fill)} '
                 f'missing COR(s) from series mean before AI Reco.</span>'
             )
 
         num_gpus = self.batch_gpus_per_machine.value()
         machine = self.batch_machine_box.currentText()
         self.log_output.append(
-            f'<span style="color:#1a8cff;font-weight:bold;">🤖 Batch AI Reco on '
+          f'<span style="color:#1a8cff;font-weight:bold;">Batch AI Reco on '
             f'{len(selected_files)} files using {num_gpus} GPU(s) — current GUI '
             f'tab settings apply to every file.</span>'
         )
 
-        # Mirror each file's per-row seed into the top-bar COR the moment
-        # _batch_run_with_queue dispatches that file's try job — not feasible
-        # because the queue runs subprocesses in parallel. Instead: for every
-        # file with a per-row COR, ensure the row's cor_input is populated so
-        # the try-reco subprocess builder (_build_batch_cmd) picks it up.
-        # (That builder already reads row_cor first, top-bar second.)
+        # Every file needs a seed COR that tomocupy's AI can refine around.
+        # Precedence: row COR > top-bar COR > centre of the image width
+        # (read from /exchange/data.shape[2] of the source H5).
         for fi in selected_files:
             row_txt = fi['cor_input'].text().strip() if fi.get('cor_input') else ""
-            if not row_txt and top_bar_ok:
+            try:
+                float(row_txt)
+                continue    # already a valid seed
+            except (ValueError, TypeError):
+                pass
+            # No row value — try top-bar, then middle-of-width.
+            if top_bar_ok:
                 fi['cor_input'].setText(top_bar_txt)
+                continue
+            mid = self._middle_of_width(fi.get('path'))
+            if mid is not None:
+              fi['cor_input'].setText(f"{mid:.1f}")
+              self.log_output.append(
+                  f'<span style="color:#888;">{os.path.basename(fi["path"])}: '
+                    f'no COR — seeding AI with mid-width = {mid:.1f}</span>'
+                )
 
         self._batch_active = True
         data_folder = self.data_path.text().strip()
         failed_inf = []      # set by Phase B (or left empty if skipped)
+        # Phase B (AI COR) now runs try + AI in a single tomocupy call, so a
+        # separate Phase A would just redo the try. Skip Phase A automatically
+        # whenever Phase B is on to avoid burning GPU time twice.
+        skip_try_for_ai = run_try and run_infer
         try:
             # ── Phase A: multi-GPU try reconstructions ───────────────
-            if run_try:
+            if run_try and not skip_try_for_ai:
                 self.log_output.append(
-                    '<span style="color:#1a8cff;">── Phase A: TRY reconstructions '
+                  '<span style="color:#1a8cff;">── Phase A: TRY reconstructions '
                     '(parallel across GPUs)…</span>'
                 )
                 QApplication.processEvents()
                 self._run_batch_with_queue(selected_files, recon_type='try',
-                                           num_gpus=num_gpus, machine=machine)
+                                            num_gpus=num_gpus, machine=machine)
+            elif skip_try_for_ai:
+                self.log_output.append(
+                  '<span style="color:#888;">── Phase A (Try) skipped — '
+                    'Phase B (AI COR) will run try + inference in one call.</span>'
+                )
             else:
                 self.log_output.append(
-                    '<span style="color:#888;">── Phase A (Try) skipped — '
+                  '<span style="color:#888;">── Phase A (Try) skipped — '
                     'using existing try_center TIFFs.</span>'
                 )
 
-            # ── Phase B: DINOv2 inference (one file per GPU slot) ────
+            # ── Phase B: tomocupy try + AI COR (one file per GPU slot) ─
             if run_infer:
                 self.log_output.append(
-                    f'<span style="color:#1a8cff;">── Phase B: DINOv2 inference — '
-                    f'{len(selected_files)} file(s), {num_gpus} GPU slot(s)…</span>'
+                  f'<span style="color:#1a8cff;">── Phase B: Try + AI COR — '
+                    f'{len(selected_files)} file(s), {num_gpus} GPU slot(s). '
+                    f'Row COR is used as the AI seed; the AI refines around it.</span>'
                 )
                 QApplication.processEvents()
                 self._run_batch_with_queue(selected_files, recon_type='infer',
-                                           num_gpus=num_gpus, machine=machine)
+                                            num_gpus=num_gpus, machine=machine)
 
                 # ─── The ONE place that writes AI CORs back to the table ───
                 # Scan column 1 (filename) to find the row, then setText on
                 # cellWidget(row, 2). No stored widget references, no lambda
-                # captures, no cross-thread state. If this doesn't work,
-                # nothing will.
+                # captures, no cross-thread state.
                 inferred = 0
                 for fi in selected_files:
                     proj_file = fi.get('path') or fi.get('file')
@@ -6050,7 +6637,7 @@ class TomoGUI(QWidget):
                     if not os.path.exists(cor_txt):
                         failed_inf.append(basename)
                         self.log_output.append(
-                            f'<span style="color:red;">   ✗ {basename}: '
+                            f'<span style="color:red;"> {basename}: '
                             f'no center_of_rotation.txt</span>'
                         )
                         continue
@@ -6063,7 +6650,7 @@ class TomoGUI(QWidget):
                     except Exception as e:
                         failed_inf.append(basename)
                         self.log_output.append(
-                            f'<span style="color:red;">   ✗ {basename}: '
+                          f'<span style="color:red;"> {basename}: '
                             f'could not parse {cor_txt} ({e})</span>'
                         )
                         continue
@@ -6080,7 +6667,7 @@ class TomoGUI(QWidget):
                             break
                     if row_found < 0:
                         self.log_output.append(
-                            f'<span style="color:red;">   ✗ {basename}: '
+                          f'<span style="color:red;"> {basename}: '
                             f'row not found in table</span>'
                         )
                         continue
@@ -6088,7 +6675,7 @@ class TomoGUI(QWidget):
                     cell_w = self.batch_file_main_table.cellWidget(row_found, 2)
                     if cell_w is None:
                         self.log_output.append(
-                            f'<span style="color:red;">   ✗ {basename}: '
+                          f'<span style="color:red;"> {basename}: '
                             f'no widget at row {row_found} col 2</span>'
                         )
                         continue
@@ -6108,13 +6695,13 @@ class TomoGUI(QWidget):
                     inferred += 1
                     if old_txt == txt:
                         self.log_output.append(
-                            f'<span style="color:#888;">   ≈ {basename}: '
+                          f'<span style="color:#888;"> {basename}: '
                             f'{txt} (unchanged)</span>'
                         )
                     else:
                         self.log_output.append(
-                            f'<span style="color:#1a8cff;">   ✎ {basename}: '
-                            f'{old_txt or "(empty)"} → {txt}</span>'
+                          f'<span style="color:#1a8cff;"> {basename}: '
+                          f'{old_txt or "(empty)"} → {txt}</span>'
                         )
 
                 # Final blanket repaint so any deferred paint events flush
@@ -6127,38 +6714,38 @@ class TomoGUI(QWidget):
                 if data_folder:
                     self._save_cor_data(data_folder, self.cor_data)
                 self.log_output.append(
-                    f'<span style="color:#1a8cff;">   Phase B done: {inferred} succeeded, '
+                    f'<span style="color:#1a8cff;"> Phase B done: {inferred} succeeded, '
                     f'{len(failed_inf)} failed.</span>'
                 )
             else:
                 self.log_output.append(
-                    '<span style="color:#888;">── Phase B (Infer) skipped — '
+                  '<span style="color:#888;">── Phase B (Infer) skipped — '
                     'Full will use CORs already in the table.</span>'
                 )
 
             # ── Phase C: multi-GPU full reconstructions ──────────────
             if run_full:
                 self.log_output.append(
-                    '<span style="color:#1a8cff;">── Phase C: FULL reconstructions '
+                  '<span style="color:#1a8cff;">── Phase C: FULL reconstructions '
                     '(parallel across GPUs)…</span>'
                 )
                 QApplication.processEvents()
                 # Only run full on files where inference actually produced a COR
                 # (or all files if Phase B was skipped — trust the existing CORs).
                 good_for_full = [fi for fi in selected_files
-                                 if os.path.basename(fi.get('path') or '')
-                                 not in set(failed_inf)]
+                                if os.path.basename(fi.get('path') or '')
+                                    not in set(failed_inf)]
                 self._run_batch_with_queue(good_for_full, recon_type='full',
-                                           num_gpus=num_gpus, machine=machine)
+                                            num_gpus=num_gpus, machine=machine)
             else:
                 self.log_output.append(
-                    '<span style="color:#888;">── Phase C (Full) skipped.</span>'
+                  '<span style="color:#888;">── Phase C (Full) skipped.</span>'
                 )
 
             # ── Phase D (optional): upload reconstructions to TomoLog ──
             if run_tomolog:
                 self.log_output.append(
-                    '<span style="color:#1a8cff;">── Phase D: TomoLog upload '
+                  '<span style="color:#1a8cff;">── Phase D: TomoLog upload '
                     '(sequential, one file at a time)…</span>'
                 )
                 QApplication.processEvents()
@@ -6209,20 +6796,20 @@ class TomoGUI(QWidget):
                             pass
                     QApplication.processEvents()
                 self.log_output.append(
-                    f'<span style="color:#1a8cff;">   Phase D done: {uploaded} uploaded, '
+                  f'<span style="color:#1a8cff;"> Phase D done: {uploaded} uploaded, '
                     f'{len(upload_failed)} failed.</span>'
                 )
         finally:
             self._batch_active = False
 
         self.log_output.append(
-            '<span style="color:green;font-weight:bold;">🏁 Batch AI Reco finished.</span>'
+          '<span style="color:green;font-weight:bold;">Batch AI Reco finished.</span>'
         )
 
     def _batch_run_full_selected(self):
         """Run full reconstruction on all selected files with GPU queue management"""
         selected_files = [f for f in self.batch_file_main_list
-                          if f['checkbox'].isChecked() and not f.get('skipped_small')]
+                            if f['checkbox'].isChecked() and not f.get('skipped_small')]
         self._persist_params_for_files([f.get('path') for f in selected_files])
         machine = self.batch_machine_box.currentText()
 
@@ -6247,32 +6834,24 @@ class TomoGUI(QWidget):
 
   #=========helper to update table based on filename========================
     def _get_full_recon_status(self, file_path):
-        """
-        Check the full reconstruction output directory and return status with slice range.
-        Returns: (status_text, status_color)
+        """Return (status_text, status_color) for the full reconstruction of
+        ``file_path``. Handles the tomocupy default H5 output as well as the
+        legacy TIFF directory.
         """
         try:
             table_folder = self.data_path.text()
             if not table_folder:
                 return "Done full", "green"
-
             filename = os.path.basename(file_path)
             proj_name = os.path.splitext(filename)[0]
-            full_dir = os.path.join(f"{table_folder}_rec", f"{proj_name}_rec")
-
-            # Check if output directory exists and has TIFF files
-            if os.path.isdir(full_dir):
-                tiff_files = sorted(glob.glob(os.path.join(full_dir, "*.tiff")))
-                if len(tiff_files) > 0:
-                    # Get slice numbers from first and last file
-                    num_1 = int(Path(tiff_files[0]).stem.split("_")[-1])
-                    num_2 = int(Path(tiff_files[-1]).stem.split("_")[-1])
-                    return f"Full {num_1}-{num_2}", "green"
-
-            # Fallback if directory doesn't exist or no files found
+            info = self._resolve_full_recon(table_folder, proj_name)
+            if info['kind'] and info['range'] is not None:
+                n1, n2 = info['range']
+                return f"Full {n1}-{n2}", "green"
+            if info['kind']:
+              return f"Full ({info['kind']})", "green"
             return "Done full", "green"
-        except Exception as e:
-            # If anything goes wrong, just return basic status
+        except Exception:
             return "Done full", "green"
 
     def _set_status_by_filename(self, filename, text, status_col=3, filename_col=1, color=None):
@@ -6306,11 +6885,11 @@ class TomoGUI(QWidget):
         """
         self._batch_active = True
         self.log_output.append(
-            f'<span style="color:magenta;">🔍 DEBUG: Starting {recon_type} batch, '
+            f'<span style="color:magenta;">DEBUG: Starting {recon_type} batch, '
             f'batch_running={self.batch_running}</span>'
         )
         self.log_output.append(
-            '<span style="color:#888;">⚙️ Using current GUI tab settings for every file in this batch.</span>'
+          '<span style="color:#888;">⚙️ Using current GUI tab settings for every file in this batch.</span>'
         )
 
         jobs_to_add = [(f, recon_type, machine) for f in selected_files]
@@ -6329,7 +6908,7 @@ class TomoGUI(QWidget):
             self.batch_job_queue.extend(jobs_to_add)
             self.batch_total_jobs += len(selected_files)
             self.log_output.append(
-                f'<span style="color:blue;">➕ Added {len(selected_files)} job(s) to running queue</span>'
+              f'<span style="color:blue;">➕ Added {len(selected_files)} job(s) to running queue</span>'
             )
             return
 
@@ -6345,7 +6924,7 @@ class TomoGUI(QWidget):
         self.batch_completed_jobs = 0
 
         self.log_output.append(
-            f'<span style="color:blue;">🚀 Starting batch queue: {len(self.batch_job_queue)} jobs, {num_gpus} GPU(s)</span>'
+          f'<span style="color:blue;">Starting batch queue: {len(self.batch_job_queue)} jobs, {num_gpus} GPU(s)</span>'
         )
 
         QApplication.processEvents()
@@ -6355,7 +6934,7 @@ class TomoGUI(QWidget):
         # Keep processing until queue is empty and all jobs are done
         while self.batch_job_queue or self.batch_running_jobs:
             self.log_output.append(
-                f'<span style="color:gray;">🔄 Queue loop: {len(self.batch_job_queue)} queued, {len(self.batch_running_jobs)} running, {len(self.batch_available_gpus)} GPUs available</span>'
+              f'<span style="color:gray;">🔄 Queue loop: {len(self.batch_job_queue)} queued, {len(self.batch_running_jobs)} running, {len(self.batch_available_gpus)} GPUs available</span>'
             )
             QApplication.processEvents()
 
@@ -6382,7 +6961,7 @@ class TomoGUI(QWidget):
                     process = self._start_batch_job_async(file_info, job_recon_type, gpu_id, job_machine)  
                 except Exception as e:
                     self.log_output.append(
-                        f'<span style="color:red;">❌ Failed to start job for {file_info.get("filename","?")}: {e}</span>'
+                      f'<span style="color:red;">Failed to start job for {file_info.get("filename","?")}: {e}</span>'
                     )
                     # Put GPU back and mark failed
                     self.batch_available_gpus.append(gpu_id)
@@ -6424,7 +7003,7 @@ class TomoGUI(QWidget):
                 self.batch_running_jobs[gpu_id] = (process, file_info, job_recon_type)
 
                 self.log_output.append(
-                    f'<span style="color:blue;">🚀 GPU {gpu_id}: Started {job_recon_type} - {file_info["filename"]} '
+                  f'<span style="color:blue;">GPU {gpu_id}: Started {job_recon_type} - {file_info["filename"]} '
                     f'(Running: {len(self.batch_running_jobs)}, Queued: {len(self.batch_job_queue)})</span>'
                 )
 
@@ -6460,7 +7039,7 @@ class TomoGUI(QWidget):
                                 filename_col=1,
                                 color=status_color
                             )
-                            self.log_output.append(f'<span style="color:green;">✅ GPU {gpu_id} finished {job_recon_type}: {file_info["filename"]}</span>')
+                            self.log_output.append(f'<span style="color:green;">GPU {gpu_id} finished {job_recon_type}: {file_info["filename"]}</span>')
                         else:
                             self._set_status_by_filename(
                                 os.path.basename(file_info["filename"]),
@@ -6469,10 +7048,10 @@ class TomoGUI(QWidget):
                                 filename_col=1,
                                 color="red"
                             )
-                            self.log_output.append(f'<span style="color:red;">❌ GPU {gpu_id} failed {job_recon_type}: {file_info["filename"]}</span>')
+                            self.log_output.append(f'<span style="color:red;">GPU {gpu_id} failed {job_recon_type}: {file_info["filename"]}</span>')
                     except RuntimeError:
                         self.log_output.append(
-                            f'<span style="color:gray;">✅ GPU {gpu_id} finished: {file_info["filename"]} (widget deleted)</span>'
+                          f'<span style="color:gray;">GPU {gpu_id} finished: {file_info["filename"]} (widget deleted)</span>'
                         )
 
                     completed_gpus.append(gpu_id)
@@ -6507,12 +7086,12 @@ class TomoGUI(QWidget):
             self.progress_window.batch_status_label.setText("Batch completed.")
             self.progress_window.batch_queue_label.setText("Queue: 0 jobs waiting")
 
-        self.log_output.append(f'<span style="color:green;">🏁 Batch queue finished: {self.batch_completed_jobs} files completed</span>')
+            self.log_output.append(f'<span style="color:green;">Batch queue finished: {self.batch_completed_jobs} files completed</span>')
 
         # Reset batch running flag so new batches can start
         self.batch_running = False
         self._batch_active = False   # re-enable per-scan param load/save on clicks
-        self.log_output.append('<span style="color:blue;">✅ batch_running set to False, ready for new batch</span>')
+        self.log_output.append('<span style="color:blue;">batch_running set to False, ready for new batch</span>')
 
 
     def _batch_stop_queue(self):
@@ -6541,19 +7120,19 @@ class TomoGUI(QWidget):
 
             # Update table status
             try:
-                self._set_status_by_filename(file_info['filename'],text="Cancelled batch",color='red')
+              self._set_status_by_filename(file_info['filename'],text="Cancelled batch",color='red')
             except Exception:
                 pass
 
             self.log_output.append(
-                f'<span style="color:orange;">🛑 Cancelled job on GPU {gpu_id}: '
-                f'{file_info.get("filename", "")}</span>'
+              f'<span style="color:orange;">Cancelled job on GPU {gpu_id}: '
+              f'{file_info.get("filename", "")}</span>'
             )
 
         # ===== Cancel queued (not yet started) jobs =====
         for file_info, job_recon_type, job_machine in self.batch_job_queue:
             try:
-                self._set_status_by_filename(file_info['filename'],text="Cancelled batch",color='red')
+              self._set_status_by_filename(file_info['filename'],text="Cancelled batch",color='red')
             except Exception:
                 pass
 
@@ -6578,7 +7157,7 @@ class TomoGUI(QWidget):
             pass
 
         self.log_output.append(
-            '<span style="color:orange;">🛑 Batch queue stopped by user</span>'
+          '<span style="color:orange;">Batch queue stopped by user</span>'
         )
             
     def _start_batch_job_async(self, file_info, recon_type, gpu_id, machine):
@@ -6589,26 +7168,81 @@ class TomoGUI(QWidget):
         file_path = file_info['path']
         filename = os.path.basename(file_path)
 
-        # AI inference: one file per worker subprocess, driven by the same queue
-        # as Phase A/C so a single stuck file only blocks one GPU, not a whole
-        # chunk.
+        # AI COR: launch tomocupy in try mode with the built-in AI center
+        # finder. Tomocupy runs the try recon, executes the AI inference on
+        # the cached slices, and writes center_of_rotation.txt inside the
+        # try output dir. The batch collector reads that file to fill in the
+        # table + feed Full.
         if recon_type == 'infer':
-            import sys as _sys
-            data_folder = self.data_path.text().strip()
             model_path = self.ai_model_path.text().strip()
             if not model_path or not os.path.exists(model_path):
                 self.log_output.append(
-                    f'<span style="color:red;">❌ AI model path invalid for {filename}</span>'
+                  f'<span style="color:red;">AI model path invalid for {filename}</span>'
                 )
                 return None
-            cmd = [_sys.executable, "-m", "tomogui._infer_worker",
-                   data_folder, model_path, file_path]
+            data_folder = self.data_path.text().strip()
+            proj_name = os.path.splitext(filename)[0]
+            try_dir = os.path.join(f"{data_folder}_rec", "try_center", proj_name)
+            stale = os.path.join(try_dir, "center_of_rotation.txt")
+            if os.path.exists(stale):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+
+            # Per-file COR seed: row first, top-bar fallback (same policy
+            # as the try phase).
+            row_cor = ""
+            if file_info.get('cor_input') is not None:
+                try:
+                    row_cor = file_info['cor_input'].text().strip()
+                except Exception:
+                    row_cor = ""
+            seed = row_cor or self.cor_input.text().strip()
+            try:
+                float(seed)
+            except (ValueError, TypeError):
+                seed = ""
+
+            recon_way = self.recon_way_box.currentText()
+            if self.use_conf_box.isChecked():
+                config_text = self.config_editor_try.toPlainText()
+                temp_conf = os.path.join(self.data_path.text(),
+                                        f"temp_infer_gpu{gpu_id}.conf")
+                with open(temp_conf, "w") as f:
+                    f.write(config_text)
+                cmd = ["tomocupy", str(recon_way),
+                      "--reconstruction-type", "try",
+                      "--config", temp_conf,
+                      "--file-name", file_path,
+                      "--rotation-axis-auto", "auto"]
+                if seed:
+                    cmd += ["--rotation-axis", seed]
+            else:
+                cmd = ["tomocupy", str(recon_way),
+                      "--reconstruction-type", "try",
+                      "--file-name", file_path,
+                      "--rotation-axis-auto", "auto"]
+                if seed:
+                    cmd += ["--rotation-axis", seed]
+                cmd += self._gather_params_args()
+                cmd += self._gather_rings_args()
+                cmd += self._gather_bhard_args()
+                cmd += self._gather_phase_args()
+                cmd += self._gather_Geometry_args()
+                cmd += self._gather_Data_args()
+                cmd += self._gather_Performance_args()
+
+            # AI flags must be applied AFTER params so they win argparse's
+            # last-value-wins tie-break (otherwise --rotation-axis-method
+            # from the Reconstruction tab would silently override "ai").
+            cmd = self._apply_ai_cor(cmd)
+
             cmd = self._get_batch_machine_command(cmd, machine)
             p = QProcess(self)
             p.setProcessChannelMode(QProcess.SeparateChannels)
             p.readyReadStandardOutput.connect(
-                lambda proc=p, fn=filename, fi=file_info:
-                    self._on_infer_output(proc, fn, fi)
+                lambda proc=p, fn=filename: self._on_process_output(proc, fn, is_error=False)
             )
             p.readyReadStandardError.connect(
                 lambda proc=p, fn=filename: self._on_process_output(proc, fn, is_error=True)
@@ -6616,15 +7250,18 @@ class TomoGUI(QWidget):
             if machine == "Local":
                 env = QProcessEnvironment.systemEnvironment()
                 env.insert("CUDA_VISIBLE_DEVICES", str(gpu_id))
+                env.insert("HDF5_USE_FILE_LOCKING", "FALSE")
                 p.setProcessEnvironment(env)
+            if cmd and cmd[0] != "env":
+                cmd = ["env", "HDF5_USE_FILE_LOCKING=FALSE"] + list(cmd)
             p.start(str(cmd[0]), [str(a) for a in cmd[1:]])
             if not p.waitForStarted(5000):
                 self.log_output.append(
-                    f'<span style="color:red;">❌ Inference worker failed to start for {filename}</span>'
+                    f'<span style="color:red;">AI COR job failed to start for {filename}</span>'
                 )
                 return None
             self.log_output.append(
-                f'<span style="color:blue;">🤖 GPU {gpu_id} inference start: {filename} '
+              f'<span style="color:blue;">GPU {gpu_id} Try+AI-COR start: {filename} '
                 f'(PID {p.processId()})</span>'
             )
             return p
@@ -6647,11 +7284,14 @@ class TomoGUI(QWidget):
                     cor = float(cor_val)
                 except ValueError:
                     self.log_output.append(
-                        f'<span style="color:red;">❌ Invalid COR "{cor_val}" for {filename}, skipping</span>'
+                      f'<span style="color:red;">Invalid COR "{cor_val}" for {filename}, skipping</span>'
                     )
                     return None  #return None to indicate failure
 
         elif recon_type == 'full':
+            # Same file about to be rewritten by tomocupy — release the
+            # viewer's H5 handle if it points at this dataset.
+            self._release_full_h5_for_write(file_path)
             recon_way = self.recon_way_box_full.currentText()
             cor_val = file_info['cor_input'].text().strip()
             rec_method = self.cor_full_method.currentText()
@@ -6664,12 +7304,12 @@ class TomoGUI(QWidget):
                     cor_val = fallback
                     file_info['cor_input'].setText(cor_val)   # reflect in the table
                     self.log_output.append(
-                        f'<span style="color:orange;">⚠️ No row COR for {filename}, '
+                      f'<span style="color:orange;">No row COR for {filename}, '
                         f'using Try-bar COR = {cor_val}</span>'
                     )
                 else:
                     self.log_output.append(
-                        f'<span style="color:orange;">⚠️ No COR value in batch table '
+                      f'<span style="color:orange;">No COR value in batch table '
                         f'for {filename} and Try-bar is empty, skipping</span>'
                     )
                     return None
@@ -6678,13 +7318,13 @@ class TomoGUI(QWidget):
                 cor = float(cor_val)
             except ValueError:
                 self.log_output.append(
-                    f'<span style="color:red;">❌ Invalid COR value "{cor_val}" for {filename}, skipping</span>'
+                  f'<span style="color:red;">Invalid COR value "{cor_val}" for {filename}, skipping</span>'
                 )
                 # Return None to skip this job - queue will handle it
                 return None
         else:
             self.log_output.append(
-                f'<span style="color:red;">❌ Unknown recon_type "{recon_type}"</span>'
+              f'<span style="color:red;">Unknown recon_type "{recon_type}"</span>'
             )
             return None  
 
@@ -6774,7 +7414,13 @@ class TomoGUI(QWidget):
         if machine == "Local":
             env = QProcessEnvironment.systemEnvironment()
             env.insert("CUDA_VISIBLE_DEVICES", str(gpu_id))
+            env.insert("HDF5_USE_FILE_LOCKING", "FALSE")
             p.setProcessEnvironment(env)
+
+        # Also wrap with `env HDF5_USE_FILE_LOCKING=FALSE` at the shell level
+        # in case the QProcess environment insert gets dropped somewhere.
+        if cmd and cmd[0] != "env":
+            cmd = ["env", "HDF5_USE_FILE_LOCKING=FALSE"] + list(cmd)
 
         # Start process
         p.start(str(cmd[0]), [str(a) for a in cmd[1:]])
@@ -6782,35 +7428,48 @@ class TomoGUI(QWidget):
         # Wait a moment for process to actually start
         if not p.waitForStarted(5000):  # Wait up to 5 seconds
             self.log_output.append(
-                f'<span style="color:red;">❌ Process failed to start for {filename}</span>'
+              f'<span style="color:red;">Process failed to start for {filename}</span>'
             )
             return None
 
         self.log_output.append(
-            f'<span style="color:blue;">✓ Process started successfully for {filename} (PID: {p.processId()})</span>'
+          f'<span style="color:blue;">Process started successfully for {filename} (PID: {p.processId()})</span>'
         )
         return p
 
     def _on_process_output(self, process, filename, is_error=False):
-        """Handle stdout/stderr from batch reconstruction processes"""
+        """Handle stdout/stderr from batch reconstruction processes.
+
+        Mirrors the child process's output to BOTH the GUI log panel and
+        the parent terminal (sys.stdout / sys.stderr). Users running tomogui
+        from a shell expect to see tomocupy progress in that shell, not just
+        in the GUI's log widget.
+        """
+        import sys
         if is_error:
             data = bytes(process.readAllStandardError()).decode(errors="ignore")
             color = "orange"
-            prefix = "⚠️"
+            sink = sys.stderr
         else:
             data = bytes(process.readAllStandardOutput()).decode(errors="ignore")
             color = "gray"
-            prefix = "▸"
+            sink = sys.stdout
 
-        if data.strip():
-            # Show output in log with filename context
-            basename = os.path.basename(filename)
-            lines = data.strip().split('\n')
-            for line in lines:
-                if line.strip():
-                    self.log_output.append(
-                        f'<span style="color:{color};">{prefix} [{basename}] {line}</span>'
-                    )
+        if not data.strip():
+            return
+
+        basename = os.path.basename(filename)
+        try:
+            sink.write(data if data.endswith("\n") else data + "\n")
+            sink.flush()
+        except (OSError, ValueError):
+            pass
+
+        for line in data.strip().split('\n'):
+            if line.strip():
+                self.log_output.append(
+                    f'<span style="color:{color};">[{basename}] {line}</span>'
+                )
 
     def _set_cor_cell(self, file_info, cor_val):
         """Robustly update a batch-table row's COR cell. Returns True iff
@@ -6821,7 +7480,7 @@ class TomoGUI(QWidget):
             txt = f"{float(cor_val):.2f}"
         except (ValueError, TypeError):
             self.log_output.append(
-                f'<span style="color:red;">   ✗ COR {base}: invalid value '
+                f'<span style="color:red;"> COR {base}: invalid value '
                 f'{cor_val!r} from AI — cell NOT updated</span>'
             )
             return False
@@ -6838,7 +7497,7 @@ class TomoGUI(QWidget):
                 widgets_written += 1
             except RuntimeError as e:
                 self.log_output.append(
-                    f'<span style="color:red;">   ✗ COR {base}: stored '
+                  f'<span style="color:red;"> COR {base}: stored '
                     f'widget is dead ({e}) — falling through to live '
                     f'cellWidget lookup</span>'
                 )
@@ -6858,13 +7517,13 @@ class TomoGUI(QWidget):
                     widgets_written += 1
                 except RuntimeError as e:
                     self.log_output.append(
-                        f'<span style="color:red;">   ✗ COR {base}: live '
+                      f'<span style="color:red;"> COR {base}: live '
                         f'cellWidget setText failed ({e})</span>'
                     )
 
         if widgets_written == 0:
             self.log_output.append(
-                f'<span style="color:red;">   ✗ COR {base}: no writable '
+              f'<span style="color:red;"> COR {base}: no writable '
                 f'widget found (file_info[\'cor_input\']={w!r}, row={r!r}) '
                 f'— UI cell NOT updated. AI value was {txt}.</span>'
             )
@@ -6876,45 +7535,29 @@ class TomoGUI(QWidget):
 
         try:
             unchanged = (old_txt and
-                         abs(float(old_txt) - float(txt)) < 1e-6)
+                            abs(float(old_txt) - float(txt)) < 1e-6)
         except (ValueError, TypeError):
             unchanged = False
         if unchanged:
             self.log_output.append(
-                f'<span style="color:#888;">   ≈ COR {base}: AI returned '
+              f'<span style="color:#888;"> COR {base}: AI returned '
                 f'the same value ({txt}) as was already in the cell '
                 f'[{widgets_written}/{widgets_seen} widget(s) updated]</span>'
             )
         elif old_txt:
             self.log_output.append(
-                f'<span style="color:#1a8cff;">   ✎ COR {base}: '
+              f'<span style="color:#1a8cff;"> COR {base}: '
                 f'{old_txt} → {txt} '
                 f'[{widgets_written}/{widgets_seen} widget(s) updated]</span>'
             )
         else:
             self.log_output.append(
-                f'<span style="color:#1a8cff;">   ✎ COR {base}: '
+              f'<span style="color:#1a8cff;"> COR {base}: '
                 f'(empty) → {txt} '
                 f'[{widgets_written}/{widgets_seen} widget(s) updated]</span>'
             )
         QApplication.processEvents()
         return True
-
-    def _on_infer_output(self, process, filename, file_info):
-        """Pipe inference worker stdout into the log. The actual COR cell
-        write is done once at the end of Phase B, not here — keeps the
-        update path singular and avoids widget-race bugs."""
-        data = bytes(process.readAllStandardOutput()).decode(errors="ignore")
-        if not data.strip():
-            return
-        basename = os.path.basename(filename)
-        for line in data.strip().split('\n'):
-            line = line.strip()
-            if line:
-                self.log_output.append(
-                    f'<span style="color:gray;">▸ [{basename}] {line}</span>'
-                )
-
 
     # ===== THEME METHODS =====
 
@@ -6926,9 +7569,9 @@ class TomoGUI(QWidget):
         """Callback when theme changes - update UI elements"""
         # Update theme toggle button icon
         if theme_name == 'bright':
-            self.theme_toggle_btn.setText("🌙")
+            self.theme_toggle_btn.setText("")
         else:
-            self.theme_toggle_btn.setText("☀")
+            self.theme_toggle_btn.setText("")
 
         # Update canvas background
         if VISPY_AVAILABLE and hasattr(self, 'canvas'):
@@ -6997,7 +7640,15 @@ class TomoGUI(QWidget):
             self.machine_config = dialog.get_config()
             self._save_machine_config(self.machine_config)
             self._populate_machine_list()  # Refresh the dropdown
-            self.log_output.append('<span style="color:green;">✓ Machine settings saved</span>')
+            self.log_output.append('<span style="color:green;">Machine settings saved</span>')
+
+    def _open_chatbot(self):
+        """Open the Claude-powered chatbot dialog (or raise it if already open)."""
+        if self._chatbot_dialog is None:
+            self._chatbot_dialog = ChatBotDialog(self, self.theme_manager)
+        self._chatbot_dialog.show()
+        self._chatbot_dialog.raise_()
+        self._chatbot_dialog.activateWindow()
 
 
 if __name__ == "__main__":

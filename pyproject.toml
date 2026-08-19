@@ -24,6 +24,9 @@ dependencies = [
     "einops>=0.6.0",
 ]
 
+[project.optional-dependencies]
+ai = ["anthropic>=0.40"]
+
 [project.scripts]
 tomogui = "tomogui.__main__:main"
 
@@ -31,4 +34,4 @@ tomogui = "tomogui.__main__:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tomogui = ["styles/*.py", "AImodels/**/*.pt", "AImodels/**/*.pth"]
+tomogui = ["styles/*.py", "chatbot_knowledge.md"]
