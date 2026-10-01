@@ -29,6 +29,7 @@ ai = ["anthropic>=0.40"]
 
 [project.scripts]
 tomogui = "tomogui.__main__:main"
+tomogui-cli = "tomogui.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

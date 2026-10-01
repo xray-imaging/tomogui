@@ -355,21 +355,34 @@ class MetadataViewer(QtWidgets.QWidget):
 class HDF5ImageDividerDialog(QtWidgets.QDialog):
     """Dialog for viewing HDF5 image division with real-time shifting and metadata"""
 
+    # View mode keys used by the "View Mode" combo. Order defines the
+    # combo's display order; "data" is the default because that's the raw
+    # projection the user usually wants to inspect first.
+    VIEW_MODES = ("data", "normalized", "white", "dark")
+    VIEW_MODE_LABELS = {
+        "data":       "Data (raw)",
+        "normalized": "Normalized ((data − dark) / (white − dark))",
+        "white":      "White field",
+        "dark":       "Dark field",
+    }
+
     def __init__(self, file_path=None, parent=None):
         super().__init__(parent)
         self.hdf5_file = None
         self.data_dataset = None
         self.data_white_dataset = None
+        self.data_dark_dataset = None   # optional; None when absent
 
         # Current state
         self.current_index = 0
         self.shift_x = 0
         self.shift_y = 0
-        self.normalization_enabled = True
+        self.view_mode = "data"          # one of VIEW_MODES
 
         # Cached images
         self.current_data = None
         self.current_white = None
+        self.current_dark = None
         self.result_image = None
 
         self.setWindowTitle("HDF5 Image Divider with Metadata Viewer")
@@ -439,10 +452,12 @@ class HDF5ImageDividerDialog(QtWidgets.QDialog):
 
         self.data_shape_label = QtWidgets.QLabel("N/A")
         self.white_shape_label = QtWidgets.QLabel("N/A")
+        self.dark_shape_label = QtWidgets.QLabel("N/A")
         self.num_images_label = QtWidgets.QLabel("N/A")
 
         info_layout.addRow("Data shape:", self.data_shape_label)
         info_layout.addRow("White shape:", self.white_shape_label)
+        info_layout.addRow("Dark shape:", self.dark_shape_label)
         info_layout.addRow("Number of images:", self.num_images_label)
 
         info_group.setLayout(info_layout)
@@ -474,16 +489,25 @@ class HDF5ImageDividerDialog(QtWidgets.QDialog):
         selection_group.setLayout(selection_layout)
         control_layout.addWidget(selection_group)
 
-        # Normalization control group
-        norm_group = QtWidgets.QGroupBox("Normalization")
+        # View-mode control group. A single combo cycles between raw data,
+        # dark-subtracted normalisation, and the flat/dark frames themselves
+        # so the user can inspect each channel that feeds the normalisation.
+        # Default is "Data (raw)" — most users open the viewer to look at
+        # projections first, not at flats/darks or at the normalised result.
+        norm_group = QtWidgets.QGroupBox("View Mode")
         norm_layout = QtWidgets.QVBoxLayout()
 
-        self.normalization_checkbox = QtWidgets.QCheckBox("Enable Normalization (data / data_white)")
-        self.normalization_checkbox.setChecked(True)
-        self.normalization_checkbox.stateChanged.connect(self._on_normalization_changed)
-        norm_layout.addWidget(self.normalization_checkbox)
+        self.view_mode_combo = QtWidgets.QComboBox()
+        for key in self.VIEW_MODES:
+            self.view_mode_combo.addItem(self.VIEW_MODE_LABELS[key], key)
+        self.view_mode_combo.setCurrentIndex(
+            self.VIEW_MODES.index(self.view_mode))
+        self.view_mode_combo.currentIndexChanged.connect(
+            self._on_view_mode_changed)
+        norm_layout.addWidget(self.view_mode_combo)
 
-        self.mode_label = QtWidgets.QLabel("Mode: <b>Division</b>")
+        self.mode_label = QtWidgets.QLabel(
+            f"Mode: <b>{self.VIEW_MODE_LABELS[self.view_mode]}</b>")
         self.mode_label.setStyleSheet("padding: 5px; background-color: #2a2a2a; border-radius: 3px;")
         norm_layout.addWidget(self.mode_label)
 
@@ -629,12 +653,35 @@ class HDF5ImageDividerDialog(QtWidgets.QDialog):
             if 'exchange/data' in self.hdf5_file and 'exchange/data_white' in self.hdf5_file:
                 self.data_dataset = self.hdf5_file['exchange/data']
                 self.data_white_dataset = self.hdf5_file['exchange/data_white']
+                # Dark is optional — legacy files may lack it. When absent
+                # we still show data/white/normalized, we just disable the
+                # Dark combo entry and fall back to a zero dark in the
+                # normalisation formula.
+                self.data_dark_dataset = (
+                    self.hdf5_file['exchange/data_dark']
+                    if 'exchange/data_dark' in self.hdf5_file else None)
 
                 self.file_path_label.setText(filename.split('/')[-1])
                 self.file_path_label.setStyleSheet("color: white;")
 
                 self.data_shape_label.setText(str(self.data_dataset.shape))
                 self.white_shape_label.setText(str(self.data_white_dataset.shape))
+                self.dark_shape_label.setText(
+                    str(self.data_dark_dataset.shape)
+                    if self.data_dark_dataset is not None else "N/A")
+
+                # Enable/disable Dark option in the combo based on presence.
+                dark_idx = self.VIEW_MODES.index("dark")
+                model = self.view_mode_combo.model()
+                item = model.item(dark_idx) if hasattr(model, "item") else None
+                if item is not None:
+                    item.setEnabled(self.data_dark_dataset is not None)
+                # If we were viewing Dark on the previous file but this one
+                # has none, fall back to Data.
+                if (self.view_mode == "dark"
+                        and self.data_dark_dataset is None):
+                    self.view_mode_combo.setCurrentIndex(
+                        self.VIEW_MODES.index("data"))
 
                 num_images = self.data_dataset.shape[0]
                 self.num_images_label.setText(str(num_images))
@@ -673,10 +720,22 @@ class HDF5ImageDividerDialog(QtWidgets.QDialog):
             self.current_index = index
             self.index_label.setText(str(index))
 
+            # Always cache Data at the slider's current index. White and
+            # dark stacks usually have far fewer frames than projections
+            # (often just one, sometimes a handful acquired around the scan)
+            # — clamp to the last available frame so the slider still
+            # controls "which flat / dark am I looking at" when there is
+            # more than one.
             self.current_data = np.array(self.data_dataset[index])
 
             white_index = min(index, self.data_white_dataset.shape[0] - 1)
             self.current_white = np.array(self.data_white_dataset[white_index])
+
+            if self.data_dark_dataset is not None:
+                dark_index = min(index, self.data_dark_dataset.shape[0] - 1)
+                self.current_dark = np.array(self.data_dark_dataset[dark_index])
+            else:
+                self.current_dark = None
 
             self._update_display()
 
@@ -686,20 +745,47 @@ class HDF5ImageDividerDialog(QtWidgets.QDialog):
             )
 
     def _update_display(self):
-        """Update the image display with current shift and normalization settings"""
+        """Update the image display for the current view mode. The X/Y
+        shift only affects the flat/dark alignment used in the normalised
+        mode — raw Data / White / Dark are shown untouched so the user is
+        looking at exactly what's on disk."""
         if self.current_data is None:
             return
 
         try:
-            if self.normalization_enabled:
-                shifted_white = self._apply_shift(self.current_white, self.shift_x, self.shift_y)
-
-                epsilon = 1e-10
-                self.result_image = self.current_data / (shifted_white + epsilon)
-
-                self.result_image = np.nan_to_num(self.result_image, nan=0.0, posinf=0.0, neginf=0.0)
-            else:
+            mode = self.view_mode
+            if mode == "data":
                 self.result_image = self.current_data.copy()
+            elif mode == "white":
+                self.result_image = (self.current_white.copy()
+                                     if self.current_white is not None
+                                     else np.zeros_like(self.current_data,
+                                                        dtype=float))
+            elif mode == "dark":
+                if self.current_dark is None:
+                    # Shouldn't happen — combo item is disabled — but be safe.
+                    self.result_image = np.zeros_like(self.current_data,
+                                                     dtype=float)
+                else:
+                    self.result_image = self.current_dark.copy()
+            else:  # "normalized"
+                shifted_white = self._apply_shift(
+                    self.current_white, self.shift_x, self.shift_y)
+                epsilon = 1e-10
+                if self.current_dark is not None:
+                    shifted_dark = self._apply_shift(
+                        self.current_dark, self.shift_x, self.shift_y)
+                    num = (self.current_data.astype(np.float32)
+                           - shifted_dark.astype(np.float32))
+                    den = (shifted_white.astype(np.float32)
+                           - shifted_dark.astype(np.float32)) + epsilon
+                else:
+                    # Legacy path: no dark available → plain data / white.
+                    num = self.current_data.astype(np.float32)
+                    den = shifted_white.astype(np.float32) + epsilon
+                self.result_image = num / den
+                self.result_image = np.nan_to_num(
+                    self.result_image, nan=0.0, posinf=0.0, neginf=0.0)
 
             self._update_statistics()
 
@@ -777,15 +863,14 @@ class HDF5ImageDividerDialog(QtWidgets.QDialog):
         """Handle slider value change"""
         self._load_and_display_image(value)
 
-    def _on_normalization_changed(self, state):
-        """Handle normalization checkbox change"""
-        self.normalization_enabled = (state == QtCore.Qt.Checked)
-
-        if self.normalization_enabled:
-            self.mode_label.setText("Mode: <b>Division (data / data_white)</b>")
-        else:
-            self.mode_label.setText("Mode: <b>Raw Data Only</b>")
-
+    def _on_view_mode_changed(self, index):
+        """Handle View Mode combo change: switch which channel is shown."""
+        key = self.view_mode_combo.itemData(index)
+        if key is None:
+            return
+        self.view_mode = key
+        label = self.VIEW_MODE_LABELS.get(key, key)
+        self.mode_label.setText(f"Mode: <b>{label}</b>")
         self._update_display()
 
     def _on_contrast_changed(self, index):
@@ -825,7 +910,10 @@ class HDF5ImageDividerDialog(QtWidgets.QDialog):
         if self.current_data is None:
             return
 
-        if not self.normalization_enabled:
+        # Shift only makes sense while looking at the normalised result —
+        # for Data / White / Dark the raw frame is what's on disk and there
+        # is nothing to align. Let other widgets handle the key instead.
+        if self.view_mode != "normalized":
             super().keyPressEvent(event)
             return
 

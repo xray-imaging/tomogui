@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QSlider, QGroupBox, QSizePolicy, QMessageBox,
     QTabWidget, QFormLayout, QCheckBox, QSpinBox, QDoubleSpinBox,
     QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,QFrame,
-    QDialog
+    QDialog, QSplitter
 )
 from PyQt5.QtCore import Qt, QEvent, QProcess, QEventLoop, QSize, QProcessEnvironment, QThread, pyqtSignal
 from PyQt5.QtGui import QColor
@@ -66,7 +66,7 @@ except ImportError:
 from .theme_manager import ThemeManager
 from .chatbot import ChatBotDialog
 from .hdf5_viewer import HDF5ImageDividerDialog
-from .batch_progress_window import ProgressWindow
+from .batch_progress_window import ProgressWindow, JobQueueWindow
 
 
 class SyncWatcher(QThread):
@@ -150,7 +150,7 @@ class MachineSettingsDialog(QDialog):
         info = QLabel(
             "Configure remote machines for batch reconstruction.\n"
             "Leave username empty to use current system username.\n"
-          "Conda environment defaults to 'tomocupy' if not specified."
+          "Conda environment defaults to 'tomoguiAI' if not specified."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -165,7 +165,7 @@ class MachineSettingsDialog(QDialog):
             machine_config = self.config.get(machine, {})
             username = machine_config.get("username", "")
             hostname = machine_config.get("hostname", machine)
-            conda_env = machine_config.get("conda_env", "tomocupy")
+            conda_env = machine_config.get("conda_env", "tomoguiAI")
 
             # Create row widget
             row = QWidget()
@@ -181,7 +181,7 @@ class MachineSettingsDialog(QDialog):
             host_input.setFixedWidth(150)
 
             conda_input = QLineEdit(conda_env)
-            conda_input.setPlaceholderText("tomocupy")
+            conda_input.setPlaceholderText("tomoguiAI")
             conda_input.setFixedWidth(100)
 
             row_layout.addWidget(QLabel("User:"))
@@ -225,7 +225,7 @@ class MachineSettingsDialog(QDialog):
                 config[machine] = {
                     "username": username or os.getenv("USER", ""),
                     "hostname": hostname,
-                    "conda_env": conda_env or "tomocupy"
+                    "conda_env": conda_env or "tomoguiAI"
                 }
         return config
 
@@ -246,6 +246,9 @@ class TomoGUI(QWidget):
         self.progress_window = ProgressWindow(self)
         #stop button in progress window stops the same batch queue
         self.progress_window.stop_requested.connect(self._batch_stop_queue)
+        # Job-queue overview is created on first open (see _show_job_queue).
+        # It's a read-only observer of batch_job_queue / batch_running_jobs.
+        self._job_queue_window = None
 
         # Load machine configuration
         self.machine_config = self._load_machine_config()
@@ -307,9 +310,9 @@ class TomoGUI(QWidget):
         refresh_btn2 = QPushButton("     Refresh     ")
         refresh_btn2.setStyleSheet("QPushButton { font-size: 10.5pt; }")
         refresh_btn2.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        refresh_btn2.clicked.connect(self.refresh_main_table)      
+        refresh_btn2.clicked.connect(self.refresh_main_table)
         refresh_btn2.setToolTip(f"Update from files status and rot_cen.json")
-        folder_layout.addWidget(refresh_btn2)  
+        folder_layout.addWidget(refresh_btn2)
         left_layout.addLayout(folder_layout)
 
         # ==== TABS (Configs + Params) ====
@@ -381,33 +384,17 @@ class TomoGUI(QWidget):
         single_ops.addWidget(clear_log_btn)
         main_tab.addLayout(single_ops)
 
-        # Row 1b - Try AI (tomocor inference)
+        # Row 1b - Try AI (tomocor inference). The AI model paths live on the
+        # AI COR tab (fine + full each own a --*-model-path field there); this
+        # row only exposes the launch button so the top area stays uncluttered.
         ai_ops = QHBoxLayout()
         ai_ops.setSpacing(6)
-        ai_model_label = QLabel("AI Model:")
-        ai_model_label.setStyleSheet("QLabel { font-size: 10.5pt; }")
-        ai_ops.addWidget(ai_model_label)
-        _default_ai_model = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "AImodels", "datav2_518_full_finetune", "epoch_10.pth",
-        )
-        self.ai_model_path = QLineEdit(_default_ai_model)
-        self.ai_model_path.setPlaceholderText("Path to model weights (.pth/.pt)")
-        self.ai_model_path.setStyleSheet("QLineEdit { font-size: 10pt; }")
-        ai_ops.addWidget(self.ai_model_path, 1)
-        def _browse_ai_model():
-            fn, _ = QFileDialog.getOpenFileName(self, "Select model weights", "", "Model files (*.pth *.pt);;All files (*)")
-            if fn:
-                self.ai_model_path.setText(fn)
-        ai_browse_btn = QPushButton("Browse")
-        ai_browse_btn.setStyleSheet("QPushButton { font-size: 10pt; }")
-        ai_browse_btn.setFixedWidth(65)
-        ai_browse_btn.clicked.connect(_browse_ai_model)
-        ai_ops.addWidget(ai_browse_btn)
+        ai_ops.addStretch(1)
         try_ai_btn = QPushButton("  AI Reco  ")
         try_ai_btn.setStyleSheet("QPushButton { font-size: 11pt; font-weight:bold; color: #1a8cff; }")
         try_ai_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        try_ai_btn.setToolTip("Run Try reconstruction, find best COR via AI, then run Full reconstruction")
+        try_ai_btn.setToolTip("Run Try reconstruction, find best COR via AI, then run Full reconstruction.\n"
+                              "Model paths are configured on the AI COR tab.")
         try_ai_btn.clicked.connect(self.try_ai_reconstruction)
         ai_ops.addWidget(try_ai_btn)
         main_tab.addLayout(ai_ops)
@@ -538,16 +525,21 @@ class TomoGUI(QWidget):
                                                         "Status", "Size", "Pixel", "View Data"])
         self.batch_file_main_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         header = self.batch_file_main_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)  # Allow user to resize columns
-        header.setSectionResizeMode(0, QHeaderView.Fixed)  # Select checkbox
-        header.setSectionResizeMode(1, QHeaderView.Interactive)  # Filename - user can resize
-        header.setSectionResizeMode(2, QHeaderView.Stretch)  # COR
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Status
-        header.setSectionResizeMode(4, QHeaderView.Stretch)  # Size
-        header.setSectionResizeMode(5, QHeaderView.Stretch)  # Actions
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # View Data
-        self.batch_file_main_table.setColumnWidth(0,50)
-        self.batch_file_main_table.setColumnWidth(1, 350) # Set initial width for filename column to be wider (can be resized by user)    
+        # Every column user-resizable (drag the header dividers). No Stretch
+        # anywhere — otherwise one column eats the rest of the row. We seed
+        # sensible default widths instead; the user is free to grow or shrink
+        # any of them. Select is fixed because resizing a checkbox cell is
+        # pointless.
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.Fixed)  # Select
+        header.setStretchLastSection(False)
+        self.batch_file_main_table.setColumnWidth(0, 50)   # Select
+        self.batch_file_main_table.setColumnWidth(1, 350)  # File Name
+        self.batch_file_main_table.setColumnWidth(2, 90)   # COR
+        self.batch_file_main_table.setColumnWidth(3, 110)  # Status
+        self.batch_file_main_table.setColumnWidth(4, 90)   # Size
+        self.batch_file_main_table.setColumnWidth(5, 140)  # Pixel
+        self.batch_file_main_table.setColumnWidth(6, 100)  # View Data
         main_tab.addWidget(self.batch_file_main_table)
         #Row 5: batch process operations
         batch_ops = QHBoxLayout()
@@ -579,6 +571,41 @@ class TomoGUI(QWidget):
         self.batch_gpus_per_machine.setFixedWidth(38)
         self.batch_gpus_per_machine.setStyleSheet("QSpinBox { font-size: 10.5pt; }")
         batch_ops.addWidget(self.batch_gpus_per_machine)
+
+        # Minimum free VRAM (MiB) required to dispatch a job onto a GPU.
+        # The queue polls nvidia-smi and skips GPUs below this threshold —
+        # if none pass, the job is held and retried next tick instead of
+        # OOM-crashing tomocupy.
+        min_vram_lbl = QLabel("min VRAM")
+        min_vram_lbl.setStyleSheet("QLabel { font-size: 10.5pt; }")
+        min_vram_lbl.setToolTip("Minimum free VRAM (MiB) required on a GPU "
+                                "before a job is dispatched to it. Jobs wait "
+                                "when no GPU has enough free memory.")
+        batch_ops.addWidget(min_vram_lbl)
+        self.batch_min_free_vram = QSpinBox()
+        self.batch_min_free_vram.setRange(0, 200_000)
+        self.batch_min_free_vram.setSingleStep(1000)
+        self.batch_min_free_vram.setValue(8000)
+        self.batch_min_free_vram.setSuffix(" MiB")
+        self.batch_min_free_vram.setFixedWidth(90)
+        self.batch_min_free_vram.setStyleSheet("QSpinBox { font-size: 10.5pt; }")
+        self.batch_min_free_vram.setToolTip(
+            "Minimum free VRAM (MiB) required on a GPU before a job is "
+            "dispatched to it. 0 disables the check.")
+        batch_ops.addWidget(self.batch_min_free_vram)
+
+        # Overview window for the batch job queue. Read-only observer of
+        # batch_running_jobs + batch_job_queue — clicking this does NOT
+        # touch the queue.
+        show_queue_btn = QPushButton("Show Queue")
+        show_queue_btn.setStyleSheet(
+            "QPushButton { font-size: 10.5pt; }")
+        show_queue_btn.setFixedWidth(105)
+        show_queue_btn.setToolTip(
+            "Open a live overview of every batch job: dataset, machine, "
+            "GPU, type, status. Auto-refreshes while open.")
+        show_queue_btn.clicked.connect(self._show_job_queue)
+        batch_ops.addWidget(show_queue_btn)
 
         # Checkbox for opening remote jobs in terminal
         self.batch_use_terminal = QCheckBox("Terminal")
@@ -770,8 +797,30 @@ class TomoGUI(QWidget):
         #og_json_layout.addLayout(log_box_layout)
         #left_layout.addLayout(log_json_layout)
         
-        main_layout.addLayout(left_layout, 4)
-        
+        # Horizontal splitter between the controls+table panel and the image
+        # preview panel. The user can drag the handle between them to make
+        # the preview bigger or the table bigger, instead of being locked
+        # into our stretch-factor ratio.
+        #
+        # NOTE on minimum widths: the data-folder row has setFixedWidth(580)
+        # on self.data_path plus two buttons, which otherwise pins the left
+        # panel's minimum width around ~900 px and leaves the splitter with
+        # nowhere to go. Overriding minimumWidth on the container lets the
+        # splitter shrink the panel below its children's natural width (the
+        # inner widgets just clip off the right edge if you drag that far).
+        self._main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
+        self._main_splitter.setHandleWidth(8)
+        self._main_splitter.setStyleSheet(
+            "QSplitter::handle { background: #555; }"
+            "QSplitter::handle:hover { background: #1a8cff; }"
+        )
+        _left_container = QWidget()
+        _left_container.setLayout(left_layout)
+        _left_container.setMinimumWidth(300)
+        self._main_splitter.addWidget(_left_container)
+        main_layout.addWidget(self._main_splitter)
+
         # ==== RIGHT PANEL ====
         right_layout = QVBoxLayout()
         toolbar_row = QHBoxLayout()
@@ -789,7 +838,14 @@ class TomoGUI(QWidget):
             error_label.setWordWrap(True)
             toolbar_row.addWidget(error_label)
             right_layout.addLayout(toolbar_row)
-            main_layout.addLayout(right_layout, 8)
+            _right_container = QWidget()
+            _right_container.setLayout(right_layout)
+            _right_container.setMinimumWidth(400)
+            self._main_splitter.addWidget(_right_container)
+            self._main_splitter.setStretchFactor(0, 4)
+            self._main_splitter.setStretchFactor(1, 8)
+            # Was [700, 1300] — now −30% on the table, +30% on the preview.
+            self._main_splitter.setSizes([490, 1690])
             self.setLayout(main_layout)
             return
 
@@ -1013,7 +1069,18 @@ class TomoGUI(QWidget):
         tomolog_group.setLayout(tomolog_layout)
         right_layout.addWidget(tomolog_group, 2)
 
-        main_layout.addLayout(right_layout, 5)
+        # Right panel goes into the splitter created when the left panel was
+        # added. Stretch factors mean a resized window grows both sides in
+        # proportion; initial sizes seed the ratio before the first resize.
+        _right_container = QWidget()
+        _right_container.setLayout(right_layout)
+        _right_container.setMinimumWidth(400)
+        self._main_splitter.addWidget(_right_container)
+        # Was [800, 1200] with stretch (4, 5) — now −30% on the table side
+        # and +30% on the image preview side, as requested.
+        self._main_splitter.setStretchFactor(0, 3)
+        self._main_splitter.setStretchFactor(1, 7)
+        self._main_splitter.setSizes([560, 1560])
         self.setLayout(main_layout)
 
         # Apply initial theme after UI is fully built
@@ -1211,28 +1278,48 @@ class TomoGUI(QWidget):
 
     def _ai_cor_args(self, ai_search_method="fine"):
         """Return tomocupy CLI flags that turn on its built-in AI COR finder
-        for a `try` reconstruction. Returns [] when the AI model path is not
-        set — callers then fall back to whatever COR method they were using.
+        for a `try` reconstruction. Returns [] when the required AI model
+        path(s) for the selected search method are not set — callers then
+        fall back to whatever COR method they were using.
 
         Tomocupy runs the try recon and the AI center search in a single
         subprocess and writes ``center_of_rotation.txt`` inside the try
         output directory (``{data}_rec/try_center/{proj}/``).
 
-        Both ``--infer-model-path`` and ``--bin-infer-model-path`` are set to
-        the same file: ``full`` mode runs the two-stage bin refinement
-        (reads ``bin_infer_model_path``) and THEN a final ``run_rec`` that
+        The actual ``--infer-model-path`` / ``--bin-infer-model-path`` flags
+        are emitted by _gather_ai_args (they live on the AI tab now), so
+        this method only returns the mode-switching flags. In ``full`` mode
+        both model paths must be set: full runs the two-stage bin refinement
+        (reads ``bin_infer_model_path``) and then a final ``run_rec`` that
         internally calls ``_find_center_ai`` (reads ``infer_model_path``).
-        Passing only one flag makes ``full`` crash on the second call.
         """
-        model_path = self.ai_model_path.text().strip()
-        if not model_path or not os.path.exists(model_path):
+        if not self._ai_model_paths_ok(ai_search_method):
             return []
         return [
             "--rotation-axis-method", "ai",
             "--ai-search-method", ai_search_method,
-            "--infer-model-path", model_path,
-            "--bin-infer-model-path", model_path,
         ]
+
+    def _ai_model_paths_ok(self, ai_search_method=None):
+        """True when the model path(s) required for the given search method
+        exist on disk. Fine needs --infer-model-path. Full needs BOTH
+        --bin-infer-model-path and --infer-model-path (the final run_rec
+        stage of full still calls _find_center_ai)."""
+        if ai_search_method is None:
+            ai_search_method = self._current_ai_search_method()
+        infer = self.ai_infer_model_path.text().strip()
+        binfer = self.ai_bin_infer_model_path.text().strip()
+        if ai_search_method == "full":
+            return (bool(binfer) and os.path.exists(binfer)
+                    and bool(infer) and os.path.exists(infer))
+        return bool(infer) and os.path.exists(infer)
+
+    def _current_ai_model_path(self):
+        """Return the path string of the model that drives the current
+        search method (for display / validation messages)."""
+        if self._current_ai_search_method() == "full":
+            return self.ai_bin_infer_model_path.text().strip()
+        return self.ai_infer_model_path.text().strip()
 
     def _read_ai_cor_from_try_dir(self, proj_file):
         """Read the last value written to center_of_rotation.txt inside the
@@ -2175,183 +2262,283 @@ class TomoGUI(QWidget):
 
 # ===== AI COR TAB =====
     def _build_ai_tab(self):
-        """AI COR settings tab. Exposes tomocupy's --infer-* (fine mode) and
-        --bin-infer-* (full/bin mode) inference parameters. The tab also owns
-        the --ai-search-method selector, which _apply_ai_cor reads to decide
-        which pipeline flag family to pass through."""
+        """AI COR settings tab. Two columns side-by-side:
+          - Left  = FINE model  (--infer-*)
+          - Right = FULL model  (--bin-infer-*)
+
+        Each column owns its own --*-model-path field (previously a single
+        shared field on the Main tab). The --ai-search-method selector at
+        the top decides which column drives _apply_ai_cor."""
         ai_tab = QWidget()
         outer = QVBoxLayout(ai_tab)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        form_host = QWidget()
-        form = QFormLayout(form_host)
-        scroll.setWidget(form_host)
+        host = QWidget()
+        host_layout = QVBoxLayout(host)
+        host_layout.setContentsMargins(6, 6, 6, 6)
+        scroll.setWidget(host)
         outer.addWidget(scroll)
 
         self.ai_widgets = {}
 
-        def _add_row(flag, kind, w, default=None, label_text=None, include=True):
-            label_text = label_text or flag
-            label_widget = QWidget()
-            h = QHBoxLayout(label_widget)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(6)
-            lbl = QLabel(label_text)
-            include_cb = None
-            if include:
-                include_cb = QCheckBox()
-                include_cb.setChecked(False)
-                h.addWidget(include_cb)
-                lbl.setEnabled(False)
-                w.setEnabled(False)
+        # Header: search-method selector (always sent).
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+        method_label = QLabel("--ai-search-method")
+        method_label.setStyleSheet("QLabel { font-weight: bold; }")
+        header_row.addWidget(method_label)
+        method_combo = QComboBox()
+        method_combo.addItems(["fine", "full"])
+        method_combo.setCurrentText("fine")
+        method_combo.setToolTip(
+            "fine: single-stage inference_pipeline (uses FINE model only).\n"
+            "full: two-stage bin_inference_pipeline (uses FULL model, "
+            "then falls back to FINE model for the final stage).")
+        header_row.addWidget(method_combo)
+        header_row.addStretch(1)
+        host_layout.addLayout(header_row)
+        # Register directly (no include checkbox) so _gather_ai_args emits it.
+        self.ai_widgets["--ai-search-method"] = ("combo", method_combo, None, "fine")
 
-                def on_toggle(checked):
-                    lbl.setEnabled(checked)
-                    w.setEnabled(checked)
-                    if not checked:
-                        if kind in ("spin", "dspin") and default is not None:
-                            w.blockSignals(True)
-                            w.setValue(default)
-                            w.blockSignals(False)
-                        elif kind == "combo":
-                            if default is not None:
-                                w.setCurrentText(str(default))
-                            else:
-                                w.setCurrentIndex(0)
-                        elif kind == "line":
-                            w.clear()
-                        elif kind == "check":
-                            w.setChecked(False)
+        # Split: two group boxes side-by-side.
+        split_row = QHBoxLayout()
+        split_row.setSpacing(10)
+        fine_group = QGroupBox("FINE model  (--infer-*)")
+        full_group = QGroupBox("FULL model  (--bin-infer-*)")
+        fine_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        full_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        fine_outer = QVBoxLayout(fine_group)
+        full_outer = QVBoxLayout(full_group)
+        fine_form_host = QWidget()
+        full_form_host = QWidget()
+        fine_form = QFormLayout(fine_form_host)
+        full_form = QFormLayout(full_form_host)
+        fine_form.setLabelAlignment(Qt.AlignLeft)
+        full_form.setLabelAlignment(Qt.AlignLeft)
+        fine_outer.addWidget(fine_form_host)
+        full_outer.addWidget(full_form_host)
+        split_row.addWidget(fine_group, 1)
+        split_row.addWidget(full_group, 1)
+        host_layout.addLayout(split_row)
+        host_layout.addStretch(1)
 
-                include_cb.toggled.connect(on_toggle)
-            else:
-                lbl.setEnabled(True)
-                w.setEnabled(True)
-            h.addWidget(lbl)
-            h.addStretch(1)
-            form.addRow(label_widget, w)
-            self.ai_widgets[flag] = (kind, w, include_cb, default)
+        # Site-default FINE checkpoint (fine_v2.pt shipped with the tomoguiAI
+        # conda env at USERTXM). FULL has no shipped weights yet, so its field
+        # is left blank until the user picks one.
+        _default_fine_model = ("/home/beams/USERTXM/conda/anaconda/envs/"
+                               "tomoguiAI/lib/python3.11/site-packages/"
+                               "tomogui/AImodels/fine_v2.pt")
+        _default_full_model = ""
 
-        def add_line(flag, placeholder="", tip="", width=240, include=True,
-                    default_text=""):
-            w = QLineEdit()
-            if placeholder:
-                w.setPlaceholderText(placeholder)
-            if tip:
-                w.setToolTip(tip)
-            w.setFixedWidth(width)
-            if default_text:
-                w.setText(default_text)
-            _add_row(flag, "line", w, default="", include=include)
+        def make_helpers(form):
+            """Return (add_line, add_combo, add_check, add_spin, add_path) that
+            all target the given QFormLayout. Row structure matches the old
+            single-form version: [include_cb] [label] : [widget]."""
 
-        def add_combo(flag, items, default=None, tip="", include=True):
-            w = QComboBox()
-            w.addItems(items)
-            if default in items:
-                w.setCurrentText(default)
-            if tip:
-                w.setToolTip(tip)
-            _add_row(flag, "combo", w, default=default, include=include)
+            def _add_row(flag, kind, w, default=None, label_text=None,
+                         include=True, visual=None):
+                label_text = label_text or flag
+                label_widget = QWidget()
+                h = QHBoxLayout(label_widget)
+                h.setContentsMargins(0, 0, 0, 0)
+                h.setSpacing(6)
+                lbl = QLabel(label_text)
+                include_cb = None
+                if include:
+                    include_cb = QCheckBox()
+                    include_cb.setChecked(False)
+                    h.addWidget(include_cb)
+                    lbl.setEnabled(False)
+                    (visual or w).setEnabled(False)
 
-        def add_check(flag, tip="", include=True, default_checked=False):
-            w = QCheckBox()
-            if default_checked:
-                w.setChecked(True)
-            if tip:
-                w.setToolTip(tip)
-            _add_row(flag, "check", w, default=False, include=include)
+                    def on_toggle(checked, _w=w, _lbl=lbl, _v=visual,
+                                  _kind=kind, _default=default):
+                        _lbl.setEnabled(checked)
+                        (_v or _w).setEnabled(checked)
+                        if not checked:
+                            if _kind in ("spin", "dspin") and _default is not None:
+                                _w.blockSignals(True)
+                                _w.setValue(_default)
+                                _w.blockSignals(False)
+                            elif _kind == "combo":
+                                if _default is not None:
+                                    _w.setCurrentText(str(_default))
+                                else:
+                                    _w.setCurrentIndex(0)
+                            elif _kind == "line":
+                                _w.clear()
+                            elif _kind == "check":
+                                _w.setChecked(False)
 
-        def add_spin(flag, minv, maxv, step=1, default=None, tip="", include=True):
-            w = QSpinBox()
-            w.setRange(minv, maxv)
-            w.setSingleStep(step)
-            if default is not None:
-                w.setValue(default)
-            if tip:
-                w.setToolTip(tip)
-            _add_row(flag, "spin", w, default=default, include=include)
+                    include_cb.toggled.connect(on_toggle)
+                else:
+                    lbl.setEnabled(True)
+                    (visual or w).setEnabled(True)
+                h.addWidget(lbl)
+                h.addStretch(1)
+                form.addRow(label_widget, visual or w)
+                self.ai_widgets[flag] = (kind, w, include_cb, default)
 
-        # Search-method selector (always included; controls which pipeline
-        # tomocupy runs and thus which flag family below is relevant).
-        add_combo("--ai-search-method", ["fine", "full"], default="fine",
-                    tip="fine: single-stage inference_pipeline. "
-                        "full: two-stage bin_inference_pipeline.",
-                  include=False)
+            def add_line(flag, placeholder="", tip="", width=240, include=True,
+                         default_text=""):
+                w = QLineEdit()
+                if placeholder:
+                    w.setPlaceholderText(placeholder)
+                if tip:
+                    w.setToolTip(tip)
+                w.setFixedWidth(width)
+                if default_text:
+                    w.setText(default_text)
+                _add_row(flag, "line", w, default="", include=include)
 
-        # ---- fine-mode --infer-* params ---------------------------------
-        add_check("--infer-use-8bits", default_checked=True,
+            def add_combo(flag, items, default=None, tip="", include=True):
+                w = QComboBox()
+                w.addItems(items)
+                if default in items:
+                    w.setCurrentText(default)
+                if tip:
+                    w.setToolTip(tip)
+                _add_row(flag, "combo", w, default=default, include=include)
+
+            def add_check(flag, tip="", include=True, default_checked=False):
+                w = QCheckBox()
+                if default_checked:
+                    w.setChecked(True)
+                if tip:
+                    w.setToolTip(tip)
+                _add_row(flag, "check", w, default=False, include=include)
+
+            def add_spin(flag, minv, maxv, step=1, default=None, tip="",
+                         include=True):
+                w = QSpinBox()
+                w.setRange(minv, maxv)
+                w.setSingleStep(step)
+                if default is not None:
+                    w.setValue(default)
+                if tip:
+                    w.setToolTip(tip)
+                _add_row(flag, "spin", w, default=default, include=include)
+
+            def add_path(flag, default_text="", placeholder="", tip=""):
+                """Model-path row with a Browse button. Always sent (no include
+                checkbox) — the path is essential for the mode."""
+                container = QWidget()
+                hb = QHBoxLayout(container)
+                hb.setContentsMargins(0, 0, 0, 0)
+                hb.setSpacing(4)
+                le = QLineEdit()
+                if placeholder:
+                    le.setPlaceholderText(placeholder)
+                if tip:
+                    le.setToolTip(tip)
+                if default_text:
+                    le.setText(default_text)
+                hb.addWidget(le, 1)
+                btn = QPushButton("Browse")
+                btn.setFixedWidth(65)
+
+                def _browse():
+                    fn, _ = QFileDialog.getOpenFileName(
+                        self, "Select model weights", "",
+                        "Model files (*.pth *.pt);;All files (*)")
+                    if fn:
+                        le.setText(fn)
+
+                btn.clicked.connect(_browse)
+                hb.addWidget(btn)
+                _add_row(flag, "line", le, default="", include=False,
+                         visual=container)
+                return le
+
+            return add_line, add_combo, add_check, add_spin, add_path
+
+        add_line_f, add_combo_f, add_check_f, add_spin_f, add_path_f = make_helpers(fine_form)
+        add_line_b, add_combo_b, add_check_b, add_spin_b, add_path_b = make_helpers(full_form)
+
+        # ---- FINE (--infer-*) column ------------------------------------
+        self.ai_infer_model_path = add_path_f(
+            "--infer-model-path", default_text=_default_fine_model,
+            placeholder="Path to FINE model weights (.pth/.pt)",
+            tip="Path to the FINE model checkpoint used by the "
+                "single-stage inference_pipeline (fine search mode).")
+        add_check_f("--infer-use-8bits", default_checked=True,
                     tip="Requantize pixels to 8 bits before inference.")
-        add_line("--infer-downsample-factor",
-                placeholder="[1] or [1,2,4]",
-                tip="List of downsample factors applied to try slices.")
-        add_line("--infer-num-windows",
-                placeholder="[3]",
-                tip="Number of aggregation windows per slice.")
-        add_line("--infer-window-size",
-                placeholder="[518]",
-                tip="Square window size (DINOv2 native = 518).")
-        add_spin("--infer-seed-number", 0, 1_000_000, step=1, default=10,
-                tip="RNG seed for reproducibility.")
-        add_combo("--infer-input-data-type", ["raw", "try"], default="raw",
+        add_line_f("--infer-downsample-factor",
+                   placeholder="[1] or [1,2,4]",
+                   tip="List of downsample factors applied to try slices.")
+        add_line_f("--infer-num-windows",
+                   placeholder="[3]",
+                   tip="Number of aggregation windows per slice.")
+        add_line_f("--infer-window-size",
+                   placeholder="[518]",
+                   tip="Square window size (DINOv2 native = 518).")
+        add_spin_f("--infer-seed-number", 0, 1_000_000, step=1, default=10,
+                   tip="RNG seed for reproducibility.")
+        add_combo_f("--infer-input-data-type", ["raw", "try"], default="raw",
                     tip="Which cache the AI inference reads from.")
-        add_check("--infer-save-intermediate-data",
+        add_check_f("--infer-save-intermediate-data",
                     tip="Save per-slice model predictions to predicts_all.npz.")
-        add_line("--infer-input-dir",
-                placeholder="/path/to/tiff/dir or blank",
-                tip="Direct TIFF input dir (bypass try cache).")
-        add_line("--infer-batch-list",
-                placeholder="/path/to/list.txt or blank",
-                tip="Batch txt file listing input directories.")
-        add_line("--infer-out-dir-name",
-                placeholder="/path/for/output or blank",
-                tip="Output batches directory.")
+        add_line_f("--infer-input-dir",
+                   placeholder="/path/to/tiff/dir or blank",
+                   tip="Direct TIFF input dir (bypass try cache).")
+        add_line_f("--infer-batch-list",
+                   placeholder="/path/to/list.txt or blank",
+                   tip="Batch txt file listing input directories.")
+        add_line_f("--infer-out-dir-name",
+                   placeholder="/path/for/output or blank",
+                   tip="Output batches directory.")
 
-        # ---- full/bin-mode --bin-infer-* params -------------------------
-        add_line("--bin-infer-bin-sizes",
-                placeholder="[24,12]",
-                tip="Pixel step per bin per refinement stage.")
-        add_line("--bin-infer-bin-counts",
-                placeholder="[4,2]",
-                tip="Bins per stage (must be even).")
-        add_spin("--bin-infer-num-frames", 1, 1024, step=1, default=2,
-                tip="Frames aggregated per bin.")
-        add_line("--bin-infer-num-windows",
-                placeholder="[20]",
-                tip="Aggregation windows for bin inference.")
-        add_line("--bin-infer-window-size",
-                placeholder="[518]",
-                tip="Square window size for bin inference.")
-        add_spin("--bin-infer-aggregator-depth", 1, 64, step=1, default=5,
-                tip="Attention layers in the feature aggregator.")
-        add_spin("--bin-infer-aggregator-num-heads", 1, 64, step=1, default=12,
-                tip="Attention heads per layer.")
-        add_line("--bin-infer-downsample-factor",
-                placeholder="[1]",
-                tip="Downsample factor applied to try slices (bin mode).")
-        add_combo("--bin-infer-input-data-type", ["raw", "try"], default="raw",
+        # ---- FULL (--bin-infer-*) column --------------------------------
+        self.ai_bin_infer_model_path = add_path_b(
+            "--bin-infer-model-path", default_text=_default_full_model,
+            placeholder="Path to FULL model weights (.pth/.pt) — none shipped yet",
+            tip="Path to the FULL model checkpoint used by the two-stage "
+                "bin_inference_pipeline (full search mode). No default is "
+                "shipped yet; leave blank until a full model is provided.")
+        add_line_b("--bin-infer-bin-sizes",
+                   placeholder="[24,12]",
+                   tip="Pixel step per bin per refinement stage.")
+        add_line_b("--bin-infer-bin-counts",
+                   placeholder="[4,2]",
+                   tip="Bins per stage (must be even).")
+        add_spin_b("--bin-infer-num-frames", 1, 1024, step=1, default=2,
+                   tip="Frames aggregated per bin.")
+        add_line_b("--bin-infer-num-windows",
+                   placeholder="[20]",
+                   tip="Aggregation windows for bin inference.")
+        add_line_b("--bin-infer-window-size",
+                   placeholder="[518]",
+                   tip="Square window size for bin inference.")
+        add_spin_b("--bin-infer-aggregator-depth", 1, 64, step=1, default=5,
+                   tip="Attention layers in the feature aggregator.")
+        add_spin_b("--bin-infer-aggregator-num-heads", 1, 64, step=1, default=12,
+                   tip="Attention heads per layer.")
+        add_line_b("--bin-infer-downsample-factor",
+                   placeholder="[1]",
+                   tip="Downsample factor applied to try slices (bin mode).")
+        add_combo_b("--bin-infer-input-data-type", ["raw", "try"], default="raw",
                     tip="Which cache the bin AI reads from.")
-        add_spin("--bin-infer-seed-number", 0, 1_000_000, step=1, default=10,
-                tip="RNG seed for reproducibility (bin mode).")
-        add_check("--bin-infer-use-8bits", default_checked=True,
+        add_spin_b("--bin-infer-seed-number", 0, 1_000_000, step=1, default=10,
+                   tip="RNG seed for reproducibility (bin mode).")
+        add_check_b("--bin-infer-use-8bits", default_checked=True,
                     tip="Requantize pixels to 8 bits (bin mode).")
-        add_check("--bin-infer-save-intermediate-data",
+        add_check_b("--bin-infer-save-intermediate-data",
                     tip="Save per-slice bin predictions to range_predicts_all.npz.")
-        add_line("--bin-infer-input-dir",
-                placeholder="/path/to/tiff/dir or blank")
-        add_line("--bin-infer-batch-list",
-                placeholder="/path/to/list.txt or blank")
-        add_line("--bin-infer-out-dir-name",
-                placeholder="/path/for/output or blank")
+        add_line_b("--bin-infer-input-dir",
+                   placeholder="/path/to/tiff/dir or blank")
+        add_line_b("--bin-infer-batch-list",
+                   placeholder="/path/to/list.txt or blank")
+        add_line_b("--bin-infer-out-dir-name",
+                   placeholder="/path/for/output or blank")
 
         self.tabs.addTab(ai_tab, "AI COR")
 
     def _gather_ai_args(self):
         """Return the AI-COR CLI flags currently enabled on the AI tab.
-        Skipped when the model path is not set (nothing else makes sense
-        without a model)."""
-        model_path = self.ai_model_path.text().strip()
-        if not model_path or not os.path.exists(model_path):
+        Skipped when the required model path(s) for the selected search
+        method are not set (nothing else makes sense without a model)."""
+        if not self._ai_model_paths_ok():
             return []
         args = []
         for flag, (kind, w, include_cb, _default) in self.ai_widgets.items():
@@ -2761,17 +2948,18 @@ class TomoGUI(QWidget):
         if not table_folder or not os.path.isdir(table_folder):
             QMessageBox.warning(self, "Warning", "Please select a valid data folder first.")
             return
-        if self.batch_running:
-            reply = QMessageBox.question(
-                self, 'Queue Running',
-                f'A batch queue is currently running ({len(self.batch_running_jobs)} jobs active, {len(self.batch_job_queue)} queued).\n\n'
-                f'Refreshing will delete the table widgets but jobs will continue running in the background.\n\n'
-                f'Continue with refresh?',
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        # A running queue does NOT block a refresh — the reconstruction
+        # subprocesses are independent of the Qt table. After the rebuild we
+        # re-bind every queued/running job to its NEW file_info (matched by
+        # filename) so completion callbacks land on the correct row and
+        # CORs are written by filename rather than by stored row index.
+        queue_was_running = self.batch_running
+        if queue_was_running:
+            self.log_output.append(
+                f'<span style="color:gray;">🔁 Refreshing table while queue is running '
+                f'({len(self.batch_running_jobs)} active, {len(self.batch_job_queue)} queued) '
+                f'— jobs continue; their table rows will be re-linked by filename.</span>'
             )
-            if reply == QMessageBox.No:
-                return
-                self.log_output.append(f'<span style="color:orange;"> Refreshed file list while queue was running - status updates may be lost</span>')
         h5_files = sorted(glob.glob(os.path.join(table_folder, "*.h5")), key=os.path.getmtime, reverse=True)
         self.batch_file_main_table.setSortingEnabled(False)
         self.batch_file_main_table.setRowCount(0)
@@ -2870,12 +3058,30 @@ class TomoGUI(QWidget):
                 self.batch_file_main_table.setItem(row, 4, size_item)
             except Exception as e:
                 self.batch_file_main_table.setItem(row, 4, QTableWidgetItem("N/A"))
-            # Actions button (placeholder for future actions)
-            actions_widget = QWidget()
-            actions_layout = QHBoxLayout(actions_widget)
-            actions_layout.setContentsMargins(2, 2, 2, 2)
-            actions_layout.setSpacing(2)
-            self.batch_file_main_table.setCellWidget(row, 5, actions_widget)
+
+            # Pixel dimensions of the raw projection stack, read from
+            # /exchange/data.shape = (nprojs, ny, nx). We show it as
+            # "nx × ny × nprojs" so the sensor dimensions come first — that
+            # is what the user typically cares about at a glance. h5py only
+            # reads the metadata header here, no pixel data.
+            pixel_str = "?"
+            try:
+                with h5py.File(f, 'r') as _fh:
+                    dset = _fh.get('exchange/data')
+                    if dset is not None and dset.ndim >= 3:
+                        nprojs, ny, nx = (int(dset.shape[0]),
+                                          int(dset.shape[1]),
+                                          int(dset.shape[2]))
+                        pixel_str = f"{nx}×{ny}×{nprojs}"
+                    elif dset is not None:
+                        pixel_str = "×".join(str(int(s)) for s in dset.shape)
+            except Exception:
+                pixel_str = "?"
+            pixel_item = QTableWidgetItem(pixel_str)
+            pixel_item.setTextAlignment(Qt.AlignCenter)
+            pixel_item.setToolTip("Raw projection stack: nx × ny × nprojs "
+                                  "from /exchange/data")
+            self.batch_file_main_table.setItem(row, 5, pixel_item)
 
             # View Data button
             view_data_btn = QPushButton("View Data")
@@ -2901,6 +3107,39 @@ class TomoGUI(QWidget):
             self.highlight_row = 0
             self.log_output.append(f'Clicked on {self.highlight_scan}')
             self._load_scan_params(self.highlight_scan)
+
+        # Re-link any live batch jobs (queued or running) to the freshly
+        # rebuilt file_info dicts, matched by filename. The reconstruction
+        # subprocesses keep running through the refresh — we only need to
+        # redirect their bookkeeping to the new widgets so results land on
+        # the right row (by name, not by index).
+        if queue_was_running:
+            self._rebind_batch_jobs_after_refresh()
+
+    def _rebind_batch_jobs_after_refresh(self):
+        """After the main table is rebuilt, walk every live batch job and
+        replace its ``file_info`` reference (which points at the now-deleted
+        widgets) with the new dict from ``batch_file_main_list`` whose
+        filename matches. Jobs whose file has disappeared from the folder
+        are left alone — their completion callbacks already guard against
+        stale widget refs and will land as a "widget deleted" log line.
+
+        Filename is the identifier we key on end-to-end: CORs are written
+        to the row whose filename matches, not to a stored row index.
+        """
+        by_name = {fi['filename']: fi for fi in self.batch_file_main_list}
+        # Running jobs: batch_running_jobs[gpu_id] = (process, file_info, recon_type)
+        for gpu_id, (process, old_fi, recon_type) in list(
+                self.batch_running_jobs.items()):
+            new_fi = by_name.get(old_fi.get('filename'))
+            if new_fi is not None:
+                self.batch_running_jobs[gpu_id] = (process, new_fi, recon_type)
+        # Queued jobs: entries are (file_info, recon_type, machine)
+        for i, entry in enumerate(list(self.batch_job_queue)):
+            old_fi, recon_type, machine = entry
+            new_fi = by_name.get(old_fi.get('filename'))
+            if new_fi is not None:
+                self.batch_job_queue[i] = (new_fi, recon_type, machine)
 
     def _save_cor_data(self, data_folder, cor_data_dict):
         """
@@ -3745,8 +3984,11 @@ class TomoGUI(QWidget):
             except ValueError:
               self.log_output.append(f'<span style="color:red;">wrong rotation axis input</span>')
               return
-        # cuda for tomocupy try
+        # cuda for tomocupy try — user-picked GPU (manual). One-shot VRAM
+        # check before we spawn; refuse rather than OOM the reconstruction.
         gpu = str(self.cuda_box_try.value())
+        if not self._check_gpu_vram(int(gpu), "Local", os.path.basename(proj_file)):
+            return
         #add check box for config, seperate from selecting parameters from GUI
         if self.use_conf_box.isChecked():
             self.log_output.append("You are using config file, only recon type, filename, rot axis from GUI")
@@ -3758,9 +4000,9 @@ class TomoGUI(QWidget):
             with open(temp_try, "w") as f:
                 f.write(config_text)
             # Base command
-            cmd = ["tomocupy", str(recon_way), 
-                "--reconstruction-type", "try", 
-                "--config", temp_try, 
+            cmd = ["tomocupy", str(recon_way),
+                "--reconstruction-type", "try",
+                "--config", temp_try,
                 "--file-name", proj_file]
             if cor_method == "auto":
                 cmd += ["--rotation-axis-auto", "auto"]
@@ -3831,9 +4073,10 @@ class TomoGUI(QWidget):
         QApplication.processEvents()
         self._persist_params_for_files([proj_file])
 
-        model_path = self.ai_model_path.text().strip()
-        if not model_path or not os.path.exists(model_path):
-            self.log_output.append('<span style="color:red;">Invalid AI model path</span>')
+        if not self._ai_model_paths_ok():
+            self.log_output.append(
+                '<span style="color:red;">Invalid AI model path — check the '
+                'FINE / FULL model fields on the AI COR tab.</span>')
             return
 
         # Resolve the starting COR seed: row first, then top-bar.
@@ -3870,6 +4113,9 @@ class TomoGUI(QWidget):
 
         recon_way = self.recon_way_box.currentText()
         gpu = str(self.cuda_box_try.value())
+        # One-shot VRAM guard for the AI Reco (single-file, manual GPU).
+        if not self._check_gpu_vram(int(gpu), "Local", os.path.basename(proj_file)):
+            return
         if self.use_conf_box.isChecked():
             self.log_output.append("You are using config file, only recon type, filename, rot axis from GUI")
             config_text = self.config_editor_try.toPlainText()
@@ -4294,6 +4540,9 @@ class TomoGUI(QWidget):
             highlight_row = self.highlight_row
             cor_method = self.cor_full_method.currentText()
             gpu = str(self.cuda_full_box.value())
+            # One-shot VRAM guard (single-file Full, manual GPU pick).
+            if not self._check_gpu_vram(int(gpu), "Local", os.path.basename(proj_file)):
+                return
             if cor_method == "manual":
                 try:
                     cor_value = float(self.batch_file_main_list[self.highlight_row]['cor_input'].text().strip())
@@ -4411,7 +4660,7 @@ class TomoGUI(QWidget):
         machine_config = self.machine_config.get(machine, {})
         username = machine_config.get("username", os.getenv("USER", ""))
         hostname = machine_config.get("hostname", machine)
-        conda_env = machine_config.get("conda_env", "tomocupy")
+        conda_env = machine_config.get("conda_env", "tomoguiAI")
 
         # Build SSH target
         if username:
@@ -4419,12 +4668,12 @@ class TomoGUI(QWidget):
         else:
             ssh_target = hostname
 
-        # Build command with conda activation
-        # Properly quote arguments for shell execution
-            remote_cmd = " ".join([f'"{str(arg)}"' if " " in str(arg) else str(arg) for arg in cmd])
+        # Build command with conda activation.
+        # Properly quote arguments for shell execution.
+        remote_cmd = " ".join([f'"{str(arg)}"' if " " in str(arg) else str(arg) for arg in cmd])
 
-        # Wrap command with conda activation
-            full_cmd = f"bash -l -c 'source ~/.bashrc && conda activate {conda_env} && {remote_cmd}'"
+        # Wrap command with conda activation.
+        full_cmd = f"bash -l -c 'source ~/.bashrc && conda activate {conda_env} && {remote_cmd}'"
 
         # Use SSH with terminal (-t) to execute the command on the remote machine
         # -t forces pseudo-terminal allocation for better output handling
@@ -4433,6 +4682,92 @@ class TomoGUI(QWidget):
         self.log_output.append(f'<span style="color:gray;">SSH: {ssh_target} (env: {conda_env})</span>')
 
         return ssh_cmd
+
+    # ===== GPU VRAM MONITORING =====
+
+    def _gpu_free_mb(self, gpu_id, machine):
+        """Return free VRAM (MiB) on GPU ``gpu_id`` of ``machine``, or None
+        when nvidia-smi cannot be queried (missing binary, SSH failure, …).
+        None means "unknown" — the dispatcher treats that as OK so the queue
+        doesn't stall when the check itself is broken.
+
+        Results are cached for a short window per (machine, gpu_id) so the
+        dispatcher's tight polling loop doesn't hammer nvidia-smi (or SSH).
+        """
+        import subprocess
+        import time as _time
+        cache = getattr(self, "_vram_cache", None)
+        if cache is None:
+            self._vram_cache = {}
+            cache = self._vram_cache
+        now = _time.monotonic()
+        cached = cache.get((machine, gpu_id))
+        if cached is not None and (now - cached[0]) < 2.0:
+            return cached[1]
+
+        smi_args = ["nvidia-smi",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                    "-i", str(gpu_id)]
+        try:
+            if machine == "Local":
+                cmd = smi_args
+                out = subprocess.check_output(
+                    cmd, stderr=subprocess.DEVNULL, timeout=5.0)
+            else:
+                mc = self.machine_config.get(machine, {})
+                username = mc.get("username", os.getenv("USER", ""))
+                hostname = mc.get("hostname", machine)
+                target = f"{username}@{hostname}" if username else hostname
+                # BatchMode + no-tty so ssh fails fast if keys aren't set up
+                # instead of hanging for a password prompt.
+                ssh_cmd = ["ssh", "-o", "BatchMode=yes",
+                           "-o", "StrictHostKeyChecking=no",
+                           "-o", "ConnectTimeout=5",
+                           target, " ".join(smi_args)]
+                out = subprocess.check_output(
+                    ssh_cmd, stderr=subprocess.DEVNULL, timeout=10.0)
+            free_mb = int(out.decode().strip().splitlines()[0])
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                FileNotFoundError, ValueError, IndexError):
+            free_mb = None
+        cache[(machine, gpu_id)] = (now, free_mb)
+        return free_mb
+
+    def _min_free_vram_mb(self):
+        """Read the min-VRAM spinbox safely (0 disables the check)."""
+        try:
+            return int(self.batch_min_free_vram.value())
+        except (AttributeError, RuntimeError):
+            return 0
+
+    def _check_gpu_vram(self, gpu_id, machine, filename=""):
+        """One-shot check: does GPU ``gpu_id`` on ``machine`` have enough
+        free VRAM to run a reconstruction? Called by every launch site right
+        before spawning the tomocupy subprocess — no polling, no retry.
+
+        Returns True to proceed. Returns False when free VRAM is below the
+        threshold; a message naming the file, GPU and current free memory
+        is logged so the user knows why the job wasn't submitted. When the
+        check itself cannot run (no nvidia-smi, SSH broken, …) we return
+        True so a broken probe never blocks a run.
+        """
+        min_free_mb = self._min_free_vram_mb()
+        if min_free_mb <= 0:
+            return True
+        free_mb = self._gpu_free_mb(gpu_id, machine)
+        if free_mb is None:
+            return True  # probe failed — trust the user's setup
+        if free_mb >= min_free_mb:
+            return True
+        tag = f" for {filename}" if filename else ""
+        self.log_output.append(
+            f'<span style="color:red;">⚠ GPU {gpu_id} on {machine} has only '
+            f'{free_mb} MiB free (need ≥ {min_free_mb}); skipping job{tag} '
+            f'to avoid an OOM crash. Wait for other jobs to finish, lower '
+            f'the min-VRAM threshold, or pick a different GPU.</span>'
+        )
+        return False
 
     # ===== COR MANAGEMENT =====
     def record_cor_main_tb(self):
@@ -6041,10 +6376,10 @@ class TomoGUI(QWidget):
             return
         self._persist_params_for_files([proj_file])
 
-        model_path = self.ai_model_path.text().strip()
-        if not model_path or not os.path.exists(model_path):
+        if not self._ai_model_paths_ok():
             QMessageBox.warning(self, "CamRot",
-                                "AI model path is not valid.")
+                                "AI model path is not valid — check the "
+                                "FINE / FULL model fields on the AI COR tab.")
             return
 
         # Read vertical image size from /exchange/data
@@ -6431,10 +6766,11 @@ class TomoGUI(QWidget):
             QMessageBox.warning(self, "Warning", "No files selected.")
             return
 
-        model_path = self.ai_model_path.text().strip()
-        if not model_path or not os.path.exists(model_path):
-          self.log_output.append('<span style="color:red;">Invalid AI model path</span>')
-          return
+        if not self._ai_model_paths_ok():
+            self.log_output.append(
+                '<span style="color:red;">Invalid AI model path — check the '
+                'FINE / FULL model fields on the AI COR tab.</span>')
+            return
 
         # AI Reco seed policy (per file): row COR if set, else top-bar COR.
         # Validate up front that every selected file will have SOMETHING to
@@ -7094,6 +7430,21 @@ class TomoGUI(QWidget):
         self.log_output.append('<span style="color:blue;">batch_running set to False, ready for new batch</span>')
 
 
+    def _show_job_queue(self):
+        """Open (or bring to front) the batch job-queue overview window.
+        Instantiated lazily so the GUI starts fast; the window observes
+        self.batch_job_queue / self.batch_running_jobs on a 1 s timer
+        and never mutates them."""
+        if self._job_queue_window is None:
+            self._job_queue_window = JobQueueWindow(self, self)
+        w = self._job_queue_window
+        w.show()
+        w.raise_()
+        w.activateWindow()
+        # Force an immediate refresh so the user sees state the moment
+        # the window paints (rather than waiting for the first timer tick).
+        w.refresh()
+
     def _batch_stop_queue(self):
         """Immediately stop the batch queue and kill all running jobs."""
 
@@ -7168,16 +7519,23 @@ class TomoGUI(QWidget):
         file_path = file_info['path']
         filename = os.path.basename(file_path)
 
+        # One-shot VRAM guard — refuse to submit onto a GPU that would OOM.
+        # Runs once per job at dispatch time (no polling loop). When it says
+        # no, we return None so the dispatcher marks the job "Skipped" and
+        # moves on rather than crashing the reconstruction.
+        if not self._check_gpu_vram(gpu_id, machine, filename):
+            return None
+
         # AI COR: launch tomocupy in try mode with the built-in AI center
         # finder. Tomocupy runs the try recon, executes the AI inference on
         # the cached slices, and writes center_of_rotation.txt inside the
         # try output dir. The batch collector reads that file to fill in the
         # table + feed Full.
         if recon_type == 'infer':
-            model_path = self.ai_model_path.text().strip()
-            if not model_path or not os.path.exists(model_path):
+            if not self._ai_model_paths_ok():
                 self.log_output.append(
-                  f'<span style="color:red;">AI model path invalid for {filename}</span>'
+                  f'<span style="color:red;">AI model path invalid for {filename} '
+                  f'— check the FINE / FULL model fields on the AI COR tab.</span>'
                 )
                 return None
             data_folder = self.data_path.text().strip()
