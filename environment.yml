@@ -9,37 +9,57 @@ dependencies:
   - python=3.11
   - pip
 
-  # CUDA toolkit >= 12.4 required for __nv_fp8_e8m0 support in CuPy/tomocupy
+  # ---------------------------------------------------------------
+  # CUDA runtime — required by cupy / pytorch / tomocupy.
+  # 12.4 is the minimum that supports __nv_fp8_e8m0 in CuPy and the
+  # NVRTC FP8 path that tomocupy uses on driver 12.8+.
+  # ---------------------------------------------------------------
   - cuda-toolkit=12.4
   - cuda-version=12.4
-
-  # CuPy for CUDA 12.x (fixes NVRTC FP8 compilation error with driver 12.8)
   - cupy=13.*
 
-  # Scientific stack — numpy 2.x compatible
+  # ---------------------------------------------------------------
+  # Scientific / IO stack. numpy 2.x branch — pins >=2.0.
+  # ---------------------------------------------------------------
   - numpy>=2.0
   - scipy>=1.13
   - h5py>=3.11
+  - hdf5
   - pillow>=10.0
+  - matplotlib>=3.7            # histogram / colormap helpers in gui.py
   - numexpr>=2.8
   - tifffile>=2023.1
+  - psutil>=5.9                # subprocess + GPU-slot management
 
-  # GUI stack
+  # ---------------------------------------------------------------
+  # GUI stack. VisPy is the preferred renderer (GPU); pyqtgraph is
+  # the SSH / software fallback that auto-activates when X11
+  # forwarding is detected.
+  # ---------------------------------------------------------------
   - pyqt=5.*
   - pyqtgraph>=0.13.3
   - vispy>=0.14
   - pyopengl>=3.1
 
-  # PyTorch with CUDA 12 (for Try AI inference)
+  # ---------------------------------------------------------------
+  # PyTorch (CUDA 12) for the AI center-of-rotation search.
+  # ---------------------------------------------------------------
   - pytorch>=2.2
   - pytorch-cuda=12.4
-
-  # Utilities
   - einops>=0.6
-  - hdf5
+  - timm>=0.9                  # DINOv2 backbone for the FINE / FULL models
 
   - pip:
-      # tomocupy (GPU tomography reconstruction)
+      # Optional: AI assistant tab (chatbot).
+      - anthropic>=0.40
+
+      # ---------------------------------------------------------
+      # External reconstruction / logging backends.
+      # tomocupy is installed from PyPI; tomolog has no PyPI wheel
+      # yet, install from source — see docs/user_guide/installation.rst.
+      # ---------------------------------------------------------
       - tomocupy
-      # tomogui (this package, editable install from source)
+      # - git+https://github.com/xray-imaging/tomolog.git   # uncomment to pull tomolog from source
+
+      # Editable install of this package.
       - -e .
